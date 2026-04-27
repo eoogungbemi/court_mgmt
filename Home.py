@@ -73,7 +73,7 @@ st.divider()
 # ── Role selector ─────────────────────────────────────────────────────────────
 st.markdown("### Select your role to continue")
 
-col_pub, col_clerk, col_lawyer = st.columns(3, gap="large")
+col_pub, col_clerk, col_lawyer, col_eval = st.columns(4, gap="large")
 
 with col_pub:
     st.markdown("""
@@ -129,6 +129,25 @@ with col_lawyer:
         "pages/3_Lawyer_Schedule.py",
         label="View My Schedule →",
         icon="👔",
+        use_container_width=True,
+    )
+
+with col_eval:
+    st.markdown("""
+    <div class="role-card">
+        <div class="role-icon">📊</div>
+        <div class="role-title">Evaluation</div>
+        <div class="role-desc">
+            Run the simulation suite. Compare baseline vs rule-based vs
+            full AI scheduling across all 20 courtrooms and 5 days.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("")
+    st.page_link(
+        "pages/4_Evaluation.py",
+        label="View Evaluation →",
+        icon="📊",
         use_container_width=True,
     )
 
