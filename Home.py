@@ -61,43 +61,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Refresh interval (URL-persisted) ─────────────────────────────────────────
-INTERVAL_OPTIONS = {
-    "30 seconds": 30,
-    "2 minutes":  120,
-    "5 minutes":  300,
-    "10 minutes": 600,
-    "15 minutes": 900,
-}
-params     = st.query_params
-saved_secs = int(params.get("refresh", 60))
-saved_label = next(
-    (k for k, v in INTERVAL_OPTIONS.items() if v == saved_secs),
-    "2 minutes",
-)
-
 # ── Header ────────────────────────────────────────────────────────────────────
-hdr_col, refresh_col = st.columns([4, 1])
-with hdr_col:
-    st.markdown("## ⚖️ AI-Assisted Court Case Management")
-    st.markdown(
-        f"**US Federal Court** · {date.today().strftime('%A, %B %d %Y')} · "
-        "Real-time queue management powered by multi-agent AI"
-    )
-with refresh_col:
-    st.markdown("<div style='padding-top:16px'></div>", unsafe_allow_html=True)
-    chosen_label = st.selectbox(
-        "Auto-refresh",
-        options=list(INTERVAL_OPTIONS.keys()),
-        index=list(INTERVAL_OPTIONS.keys()).index(saved_label),
-        key="home_refresh",
-    )
-    chosen_secs = INTERVAL_OPTIONS[chosen_label]
-    if chosen_secs != saved_secs:
-        st.query_params["refresh"] = str(chosen_secs)
-        st.rerun()
-    st.caption(f"Refreshes every {chosen_label}")
-
+st.markdown("## ⚖️ AI-Assisted Court Case Management")
+st.markdown(
+    f"**US Federal Court** · {date.today().strftime('%A, %B %d %Y')} · "
+    "Real-time queue management powered by multi-agent AI"
+)
 st.divider()
 
 
@@ -336,6 +305,6 @@ st.caption(
 
 # Auto-refresh every 60 seconds
 st.markdown(
-    f'<meta http-equiv="refresh" content="{chosen_secs}">',
+    '<meta http-equiv="refresh" content="60">',
     unsafe_allow_html=True,
 )

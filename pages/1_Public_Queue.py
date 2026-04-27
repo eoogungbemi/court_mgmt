@@ -16,56 +16,13 @@ st.set_page_config(
 )
 init_db()
 
-# ── Refresh interval (persisted in URL so it survives meta-refresh) ───────────
-INTERVAL_OPTIONS = {
-    "30 seconds":  30,
-    "2 minutes":   120,
-    "5 minutes":   300,
-    "10 minutes":  600,
-    "15 minutes":  900,
-}
-
-params        = st.query_params
-saved_secs    = int(params.get("refresh", 30))
-saved_label   = next(
-    (k for k, v in INTERVAL_OPTIONS.items() if v == saved_secs),
-    "30 seconds",
+st.markdown("## 📺 Live Courtroom Queue")
+st.caption(
+    f"Updated: {datetime.now().strftime('%I:%M:%S %p')} · "
+    f"{date.today().strftime('%A, %B %d %Y')} · "
+    "Auto-refreshes every 30 seconds"
 )
-
-# ── Header row ────────────────────────────────────────────────────────────────
-hdr, ctrl = st.columns([3, 1])
-
-with hdr:
-    st.markdown("## 📺 Live Courtroom Queue")
-    st.caption(
-        f"Updated: {datetime.now().strftime('%I:%M:%S %p')} · "
-        f"{date.today().strftime('%A, %B %d %Y')}"
-    )
-    st.page_link("Home.py", label="← Back to Home", icon="⚖️")
-
-with ctrl:
-    st.markdown("<div style='padding-top:8px'></div>", unsafe_allow_html=True)
-    chosen_label = st.selectbox(
-        "Auto-refresh",
-        options=list(INTERVAL_OPTIONS.keys()),
-        index=list(INTERVAL_OPTIONS.keys()).index(saved_label),
-        key="refresh_select",
-    )
-    chosen_secs = INTERVAL_OPTIONS[chosen_label]
-
-    # Persist to URL whenever the user changes the setting
-    if chosen_secs != saved_secs:
-        st.query_params["refresh"] = str(chosen_secs)
-        st.rerun()
-
-    mins_left = chosen_secs // 60
-    secs_left = chosen_secs % 60
-    if mins_left:
-        next_refresh = f"Next refresh in ~{mins_left}m {secs_left:02d}s" if secs_left else f"Next refresh in ~{mins_left}m"
-    else:
-        next_refresh = f"Next refresh in ~{chosen_secs}s"
-    st.caption(next_refresh)
-
+st.page_link("Home.py", label="← Back to Home", icon="⚖️")
 st.divider()
 
 st.info(
@@ -101,6 +58,7 @@ try:
     today = date.today()
     courtrooms = db.execute(select(Courtroom).order_by(Courtroom.id)).scalars().all()
 
+    # 4-column grid
     cols = st.columns(4, gap="medium")
 
     for idx, room in enumerate(courtrooms):
@@ -145,6 +103,7 @@ try:
                         unsafe_allow_html=True,
                     )
 
+                remaining = [h for h in day_hearings if h.status == "scheduled"]
                 if len(day_hearings) > 7:
                     st.caption(f"+ {len(day_hearings) - 7} more hearings")
 
@@ -153,9 +112,4 @@ finally:
 
 st.divider()
 st.page_link("Home.py", label="← Back to Home", icon="⚖️")
-
-# Inject the meta refresh using the chosen interval
-st.markdown(
-    f'<meta http-equiv="refresh" content="{chosen_secs}">',
-    unsafe_allow_html=True,
-)
+st.markdown('<meta http-equiv="refresh" content="30">', unsafe_allow_html=True)
