@@ -16,6 +16,7 @@ env/
 # Environment / secrets
 .env
 *.env
+.streamlit/secrets.toml
 
 # Database (generated — run `./run.sh seed` to recreate)
 *.db
