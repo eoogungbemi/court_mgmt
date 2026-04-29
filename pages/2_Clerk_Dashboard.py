@@ -1,8 +1,10 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import io
 import json
 from datetime import date, datetime, time, timedelta
+import pandas as pd
 import streamlit as st
 from sqlalchemy import select, func
 
@@ -145,12 +147,13 @@ finally:
 # CASE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-with st.expander("📁 Case Management — Add · Reschedule · Remove", expanded=False):
+with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk Upload", expanded=False):
 
-    add_tab, reschedule_tab, remove_tab = st.tabs([
+    add_tab, reschedule_tab, remove_tab, bulk_tab = st.tabs([
         "➕  Add Case",
         "🕐  Set / Change Time",
         "🗑️  Remove Case",
+        "📤  Bulk Upload",
     ])
 
     # ── ADD CASE ──────────────────────────────────────────────────────────────
@@ -487,6 +490,278 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove", expande
                     st.error(f"Action failed: {e}")
                 finally:
                     _db.close()
+
+    # ── BULK UPLOAD ───────────────────────────────────────────────────────────
+    with bulk_tab:
+        st.markdown("**Upload a CSV or Excel file to add multiple cases at once**")
+        st.caption(
+            "All rows are assigned to the courtroom selected in the sidebar. "
+            "Rows with validation errors are skipped — valid rows are committed together."
+        )
+
+        # ── Template download ─────────────────────────────────────────────────
+        _TEMPLATE_COLS = [
+            "accused_name", "case_type", "hearing_type",
+            "complexity", "hearing_date", "start_time", "lawyer_bar_number",
+        ]
+        _TEMPLATE_ROWS = [
+            ["Jane Smith",   "criminal", "arraignment",       "low",    "2026-04-30", "09:00", "BAR-001"],
+            ["John Doe",     "civil",    "status_conference", "medium", "2026-04-30", "10:00", "BAR-002"],
+            ["Alice Brown",  "traffic",  "plea_hearing",      "low",    "2026-04-30", "11:00", "BAR-003"],
+        ]
+        _template_buf = io.BytesIO()
+        pd.DataFrame(_TEMPLATE_ROWS, columns=_TEMPLATE_COLS).to_csv(
+            _template_buf, index=False
+        )
+        st.download_button(
+            "⬇️  Download template CSV",
+            data=_template_buf.getvalue(),
+            file_name="case_upload_template.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )
+
+        # ── Valid hearing types flat set for quick lookup ──────────────────────
+        _ALL_HEARING_TYPES = {
+            ht for hts in HEARING_TYPES.values() for ht in hts
+        }
+
+        # ── File uploader ──────────────────────────────────────────────────────
+        uploaded = st.file_uploader(
+            "Choose a CSV or Excel file",
+            type=["csv", "xlsx"],
+            key="bulk_uploader",
+        )
+
+        if uploaded is not None:
+            # Parse
+            try:
+                if uploaded.name.endswith(".xlsx"):
+                    raw_df = pd.read_excel(uploaded, dtype=str)
+                else:
+                    raw_df = pd.read_csv(uploaded, dtype=str)
+            except Exception as e:
+                st.error(f"Could not parse file: {e}")
+                raw_df = None
+
+            if raw_df is not None:
+                raw_df.columns = [c.strip().lower() for c in raw_df.columns]
+                missing_cols = [c for c in _TEMPLATE_COLS if c not in raw_df.columns]
+                if missing_cols:
+                    st.error(
+                        f"File is missing required column(s): "
+                        f"**{', '.join(missing_cols)}**. "
+                        "Download the template above to see the expected format."
+                    )
+                else:
+                    raw_df = raw_df[_TEMPLATE_COLS].copy()
+                    raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+
+                    # Load lawyers once for lookup
+                    _db_bl = get_db()
+                    all_lawyers_bulk = _db_bl.execute(
+                        select(Lawyer).order_by(Lawyer.name)
+                    ).scalars().all()
+                    _db_bl.close()
+                    lawyers_by_bar = {l.bar_number: l for l in all_lawyers_bulk}
+
+                    # ── Per-row validation ─────────────────────────────────────
+                    preview_rows = []
+                    _db_val = get_db()
+                    try:
+                        for idx, row in raw_df.iterrows():
+                            errors, warnings = [], []
+
+                            def _get(col):
+                                v = row.get(col, "")
+                                return "" if pd.isna(v) else str(v).strip()
+
+                            accused_name  = _get("accused_name")
+                            case_type     = _get("case_type").lower()
+                            hearing_type  = _get("hearing_type").lower()
+                            complexity    = _get("complexity").lower()
+                            date_str      = _get("hearing_date")
+                            time_str      = _get("start_time")
+                            bar_num       = _get("lawyer_bar_number")
+
+                            if not accused_name:
+                                errors.append("accused_name is required")
+                            if case_type not in HEARING_TYPES:
+                                errors.append(f"case_type must be criminal/civil/traffic (got '{case_type}')")
+                            elif hearing_type not in HEARING_TYPES[case_type]:
+                                valid = ", ".join(HEARING_TYPES[case_type])
+                                errors.append(f"hearing_type '{hearing_type}' invalid for {case_type} (valid: {valid})")
+                            if complexity not in ("low", "medium", "high"):
+                                errors.append(f"complexity must be low/medium/high (got '{complexity}')")
+
+                            h_date, h_time = None, None
+                            try:
+                                h_date = pd.to_datetime(date_str).date()
+                            except Exception:
+                                errors.append(f"hearing_date invalid (use YYYY-MM-DD, got '{date_str}')")
+                            try:
+                                h_time = datetime.strptime(time_str, "%H:%M").time()
+                            except Exception:
+                                errors.append(f"start_time invalid (use HH:MM 24-hour, got '{time_str}')")
+
+                            lawyer = lawyers_by_bar.get(bar_num)
+                            if not lawyer:
+                                errors.append(f"No lawyer found with bar # '{bar_num}'")
+
+                            if not errors and h_date and h_time and lawyer:
+                                start_dt = datetime.combine(h_date, h_time)
+                                dur = estimate_duration(case_type, hearing_type, complexity)
+                                end_dt = start_dt + timedelta(minutes=dur)
+                                if not lawyer_is_free(_db_val, lawyer.id, start_dt, end_dt):
+                                    warnings.append(
+                                        f"{lawyer.name} has a scheduling conflict "
+                                        f"at {start_dt.strftime('%-I:%M %p')}"
+                                    )
+
+                            if errors:
+                                status = "❌ Error"
+                                notes  = "; ".join(errors)
+                            elif warnings:
+                                status = "⚠️ Conflict"
+                                notes  = "; ".join(warnings)
+                            else:
+                                status = "✅ Ready"
+                                notes  = ""
+
+                            preview_rows.append({
+                                "Row":          idx + 1,
+                                "Status":       status,
+                                "Accused":      accused_name,
+                                "Case type":    case_type.title(),
+                                "Hearing type": hearing_type.replace("_", " ").title(),
+                                "Date":         date_str,
+                                "Time":         time_str,
+                                "Lawyer bar #": bar_num,
+                                "Notes":        notes,
+                            })
+                    finally:
+                        _db_val.close()
+
+                    # ── Preview table ──────────────────────────────────────────
+                    preview_df = pd.DataFrame(preview_rows)
+                    n_ready    = sum(1 for r in preview_rows if r["Status"] == "✅ Ready")
+                    n_conflict = sum(1 for r in preview_rows if r["Status"] == "⚠️ Conflict")
+                    n_error    = sum(1 for r in preview_rows if r["Status"] == "❌ Error")
+                    n_commit   = n_ready + n_conflict
+
+                    pc1, pc2, pc3 = st.columns(3)
+                    pc1.metric("Ready to commit", n_ready, delta=None)
+                    pc2.metric("Has conflict (will still commit)", n_conflict)
+                    pc3.metric("Errors (will skip)", n_error)
+
+                    st.dataframe(
+                        preview_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Status": st.column_config.TextColumn(width="small"),
+                            "Notes":  st.column_config.TextColumn(width="large"),
+                        },
+                    )
+
+                    if n_commit == 0:
+                        st.error("No valid rows to commit. Fix the errors above and re-upload.")
+                    else:
+                        st.info(
+                            f"**{n_commit} row(s)** will be added to "
+                            f"**{room_map[selected_id]}**. "
+                            f"{n_error} error row(s) will be skipped."
+                        )
+                        bulk_confirm = st.checkbox(
+                            f"Confirm: add {n_commit} case(s) to the docket",
+                            key="bulk_confirm",
+                        )
+                        if st.button(
+                            f"📥 Commit {n_commit} case(s)",
+                            type="primary",
+                            disabled=not bulk_confirm,
+                            use_container_width=True,
+                            key="bulk_commit",
+                        ):
+                            _db_ins = get_db()
+                            inserted, skipped = 0, 0
+                            try:
+                                courtroom_obj = _db_ins.get(Courtroom, selected_id)
+                                for row_dict, raw_row in zip(
+                                    preview_rows, raw_df.itertuples(index=False)
+                                ):
+                                    if row_dict["Status"] == "❌ Error":
+                                        skipped += 1
+                                        continue
+
+                                    ct  = str(getattr(raw_row, "case_type")).strip().lower()
+                                    ht  = str(getattr(raw_row, "hearing_type")).strip().lower()
+                                    cmp = str(getattr(raw_row, "complexity")).strip().lower()
+                                    acc = str(getattr(raw_row, "accused_name")).strip()
+                                    h_d = pd.to_datetime(
+                                        str(getattr(raw_row, "hearing_date"))
+                                    ).date()
+                                    h_t = datetime.strptime(
+                                        str(getattr(raw_row, "start_time")).strip(), "%H:%M"
+                                    ).time()
+                                    bar = str(getattr(raw_row, "lawyer_bar_number")).strip()
+                                    lyr = lawyers_by_bar[bar]
+
+                                    start_dt = datetime.combine(h_d, h_t)
+                                    dur      = estimate_duration(ct, ht, cmp)
+                                    end_dt   = start_dt + timedelta(minutes=dur)
+                                    case_num = next_case_number(_db_ins, ct, selected_id)
+
+                                    new_case = Case(
+                                        case_number=case_num,
+                                        case_type=ct,
+                                        complexity=cmp,
+                                        status="active",
+                                        defense_lawyer_id=lyr.id,
+                                    )
+                                    _db_ins.add(new_case)
+                                    _db_ins.flush()
+
+                                    _db_ins.add(Accused(
+                                        name=acc,
+                                        case_id=new_case.id,
+                                    ))
+
+                                    new_hearing = Hearing(
+                                        case_id=new_case.id,
+                                        courtroom_id=selected_id,
+                                        judge_id=courtroom_obj.judge.id,
+                                        hearing_type=ht,
+                                        scheduled_start=start_dt,
+                                        scheduled_end=end_dt,
+                                        estimated_duration_mins=dur,
+                                        status="scheduled",
+                                    )
+                                    _db_ins.add(new_hearing)
+                                    _db_ins.flush()
+
+                                    audit(_db_ins, "HEARING_ADDED", new_hearing.id, {
+                                        "case_number":  case_num,
+                                        "case_type":    ct,
+                                        "hearing_type": ht,
+                                        "start":        start_dt.isoformat(),
+                                        "lawyer_id":    lyr.id,
+                                        "source":       "bulk_upload",
+                                    })
+                                    inserted += 1
+
+                                _db_ins.commit()
+                                st.success(
+                                    f"✅ **{inserted} case(s) added** to "
+                                    f"{room_map[selected_id]}. "
+                                    + (f"{skipped} row(s) skipped." if skipped else "")
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                _db_ins.rollback()
+                                st.error(f"Bulk insert failed: {e}")
+                            finally:
+                                _db_ins.close()
 
 st.divider()
 
