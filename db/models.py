@@ -64,7 +64,7 @@ class Accused(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
-    case_id = Column(Integer, ForeignKey("cases.id"), unique=True, nullable=False)
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=False)
     phone = Column(String, nullable=True)
 
     case = relationship("Case", back_populates="accused")

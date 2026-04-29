@@ -23,9 +23,20 @@ st.set_page_config(
 )
 init_db()
 
+PRO_SE_BAR = "PRO-SE"
+
 
 def get_db():
     return SessionLocal()
+
+
+# Resolve PRO-SE placeholder ID once per session load
+_db_ps = get_db()
+_pro_se_rec = _db_ps.execute(
+    select(Lawyer).where(Lawyer.bar_number == PRO_SE_BAR)
+).scalar_one_or_none()
+_db_ps.close()
+PRO_SE_ID: int | None = _pro_se_rec.id if _pro_se_rec else None
 
 
 HEARING_TYPES = {
@@ -236,6 +247,20 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
         st.markdown("**Add a new case and first hearing to the docket**")
         st.caption("The case number is generated automatically.")
 
+        # Pro se checkbox outside form so lawyer section can react to it
+        ac_pro_se = st.checkbox(
+            "Pro se — defendant is self-represented (no defence counsel required)",
+            key="ac_pro_se",
+        )
+
+        _db_acl = get_db()
+        _all_lawyers = _db_acl.execute(
+            select(Lawyer)
+            .where(Lawyer.bar_number != PRO_SE_BAR)
+            .order_by(Lawyer.name)
+        ).scalars().all()
+        _db_acl.close()
+
         with st.form("add_case_form", clear_on_submit=True):
             a1, a2 = st.columns(2)
             with a1:
@@ -251,20 +276,21 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                 )
             with a2:
                 ac_accused = st.text_input("Accused full name")
+                ac_phone   = st.text_input("Accused phone (optional)", placeholder="e.g. 555-0100")
                 ac_date = st.date_input("Hearing date", value=run_date, key="ac_date")
                 ac_time = st.time_input("Start time", value=time(9, 0), step=300, key="ac_time")
 
-            _db_acl = get_db()
-            _all_lawyers = _db_acl.execute(
-                select(Lawyer).order_by(Lawyer.name)
-            ).scalars().all()
-            _db_acl.close()
-            lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})" for l in _all_lawyers}
-            ac_lawyer_id = st.selectbox(
-                "Defence lawyer",
-                options=list(lawyer_opts.keys()),
-                format_func=lambda x: lawyer_opts[x],
-            )
+            if ac_pro_se:
+                st.info("Self-represented — no counsel will be assigned.")
+                ac_lawyer_id = None
+            else:
+                lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})" for l in _all_lawyers}
+                ac_lawyer_id = st.selectbox(
+                    "Defence lawyer",
+                    options=list(lawyer_opts.keys()),
+                    format_func=lambda x: lawyer_opts[x],
+                )
+
             ac_notes = st.text_area(
                 "Clerk notes (optional)",
                 placeholder="e.g. Interpreter required · Defendant in custody · Remote hearing",
@@ -274,7 +300,7 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                 "Add to Docket", type="primary", use_container_width=True
             )
 
-        # Availability checker — outside form so it's reactive  [blocking gap #4]
+        # Availability checker — outside form so it's reactive
         with st.expander("🗓️ Check lawyer availability at a time", expanded=False):
             av1, av2 = st.columns(2)
             with av1:
@@ -291,27 +317,35 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
         if ac_submitted:
             if not ac_accused.strip():
                 st.error("Accused name is required.")
+            elif not ac_pro_se and not ac_lawyer_id:
+                st.error("Select a defence lawyer or check Pro Se.")
             else:
                 _db = get_db()
                 try:
+                    _lawyer_id = PRO_SE_ID if ac_pro_se else ac_lawyer_id
                     start_dt = datetime.combine(ac_date, ac_time)
                     dur = estimate_duration(ac_case_type, ac_hearing_type, ac_complexity)
                     end_dt = start_dt + timedelta(minutes=dur)
-                    if not lawyer_is_free(_db, ac_lawyer_id, start_dt, end_dt):
-                        st.warning(
-                            f"⚠️ **{lawyer_opts[ac_lawyer_id].split('  ')[0]}** has a "
-                            f"conflict at {start_dt.strftime('%-I:%M %p')}. "
-                            "Case added — conflict flagged."
-                        )
+                    if not ac_pro_se and not lawyer_is_free(_db, _lawyer_id, start_dt, end_dt):
+                        if not ac_pro_se:
+                            st.warning(
+                                f"⚠️ **{lawyer_opts[_lawyer_id].split('  ')[0]}** has a "
+                                f"conflict at {start_dt.strftime('%-I:%M %p')}. "
+                                "Case added — conflict flagged."
+                            )
                     courtroom = _db.get(Courtroom, selected_id)
                     case_num = next_case_number(_db, ac_case_type, selected_id)
                     new_case = Case(
                         case_number=case_num, case_type=ac_case_type,
                         complexity=ac_complexity, status="active",
-                        defense_lawyer_id=ac_lawyer_id,
+                        defense_lawyer_id=_lawyer_id,
                     )
                     _db.add(new_case); _db.flush()
-                    _db.add(Accused(name=ac_accused.strip(), case_id=new_case.id))
+                    _db.add(Accused(
+                        name=ac_accused.strip(),
+                        case_id=new_case.id,
+                        phone=ac_phone.strip() or None,
+                    ))
                     new_hearing = Hearing(
                         case_id=new_case.id, courtroom_id=selected_id,
                         judge_id=courtroom.judge.id, hearing_type=ac_hearing_type,
@@ -323,7 +357,7 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                     audit(_db, "HEARING_ADDED", new_hearing.id, {
                         "case_number": case_num, "case_type": ac_case_type,
                         "hearing_type": ac_hearing_type, "start": start_dt.isoformat(),
-                        "lawyer_id": ac_lawyer_id,
+                        "lawyer_id": _lawyer_id, "pro_se": ac_pro_se,
                     })
                     _db.commit()
                     st.success(
@@ -401,9 +435,18 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                 fu_time = st.time_input("Start time", value=time(9, 0), step=300, key="fu_time")
             fu_start = datetime.combine(fu_date, fu_time)
 
+            fu_pro_se = st.checkbox(
+                "Pro se — defendant is self-represented (no counsel required)",
+                key="fu_pro_se",
+                value=(sel_case.defense_lawyer and
+                       sel_case.defense_lawyer.bar_number == PRO_SE_BAR),
+            )
+
             _db_flaw = get_db()
             all_lawyers_fu = _db_flaw.execute(
-                select(Lawyer).order_by(Lawyer.name)
+                select(Lawyer)
+                .where(Lawyer.bar_number != PRO_SE_BAR)
+                .order_by(Lawyer.name)
             ).scalars().all()
             _db_flaw.close()
 
@@ -431,16 +474,20 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                     )
                 fu_lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})"
                                   for l in all_lawyers_fu}
-                _def_idx = (
-                    list(fu_lawyer_opts.keys()).index(sel_case.defense_lawyer_id)
-                    if sel_case.defense_lawyer_id in fu_lawyer_opts else 0
-                )
-                fu_lawyer_id = st.selectbox(
-                    "Defence lawyer",
-                    options=list(fu_lawyer_opts.keys()),
-                    index=_def_idx,
-                    format_func=lambda x: fu_lawyer_opts[x],
-                )
+                if fu_pro_se:
+                    st.info("Self-represented — no counsel will be assigned.")
+                    fu_lawyer_id = None
+                else:
+                    _def_idx = (
+                        list(fu_lawyer_opts.keys()).index(sel_case.defense_lawyer_id)
+                        if sel_case.defense_lawyer_id in fu_lawyer_opts else 0
+                    )
+                    fu_lawyer_id = st.selectbox(
+                        "Defence lawyer",
+                        options=list(fu_lawyer_opts.keys()),
+                        index=_def_idx,
+                        format_func=lambda x: fu_lawyer_opts[x],
+                    )
                 fu_notes = st.text_area(
                     "Clerk notes (optional)",
                     placeholder="e.g. Interpreter required · Defendant in custody · Remote hearing",
@@ -453,11 +500,12 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
             if fu_submitted:
                 _db = get_db()
                 try:
+                    _fu_lawyer_id = PRO_SE_ID if fu_pro_se else fu_lawyer_id
                     dur = estimate_duration(sel_case.case_type, fu_hearing_type, fu_complexity)
                     end_dt = fu_start + timedelta(minutes=dur)
-                    if not lawyer_is_free(_db, fu_lawyer_id, fu_start, end_dt):
+                    if not fu_pro_se and not lawyer_is_free(_db, _fu_lawyer_id, fu_start, end_dt):
                         st.warning(
-                            f"⚠️ **{fu_lawyer_opts[fu_lawyer_id].split('  ')[0]}** has a "
+                            f"⚠️ **{fu_lawyer_opts[_fu_lawyer_id].split('  ')[0]}** has a "
                             f"conflict at {fu_start.strftime('%-I:%M %p')}. "
                             "Hearing added — conflict flagged."
                         )
@@ -472,12 +520,12 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                     )
                     _db.add(new_h); _db.flush()
 
-                    if fu_lawyer_id != sel_case.defense_lawyer_id:
+                    if _fu_lawyer_id != sel_case.defense_lawyer_id:
                         old_lid = sel_case.defense_lawyer_id
-                        _db.get(Case, fu_case_id).defense_lawyer_id = fu_lawyer_id
+                        _db.get(Case, fu_case_id).defense_lawyer_id = _fu_lawyer_id
                         audit(_db, "LAWYER_CHANGED", fu_case_id, {
                             "case_number": sel_case.case_number,
-                            "old_lawyer_id": old_lid, "new_lawyer_id": fu_lawyer_id,
+                            "old_lawyer_id": old_lid, "new_lawyer_id": _fu_lawyer_id,
                         }, entity_type="case")
 
                     audit(_db, "HEARING_ADDED", new_h.id, {
@@ -485,7 +533,9 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                         "case_type": sel_case.case_type,
                         "hearing_type": fu_hearing_type,
                         "start": fu_start.isoformat(),
-                        "lawyer_id": fu_lawyer_id, "followup": True,
+                        "lawyer_id": _fu_lawyer_id,
+                        "pro_se": fu_pro_se,
+                        "followup": True,
                     })
                     _db.commit()
                     st.success(
@@ -630,11 +680,17 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
 
             _db_ecl = get_db()
             all_lawyers_ec = _db_ecl.execute(
-                select(Lawyer).order_by(Lawyer.name)
+                select(Lawyer)
+                .where(Lawyer.bar_number != PRO_SE_BAR)
+                .order_by(Lawyer.name)
             ).scalars().all()
             _db_ecl.close()
-            ec_lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})"
-                              for l in all_lawyers_ec}
+            # Build opts — prepend Pro Se so clerk can switch to/from it
+            ec_lawyer_opts = {}
+            if PRO_SE_ID:
+                ec_lawyer_opts[PRO_SE_ID] = "Self-Represented (Pro Se)"
+            ec_lawyer_opts.update({l.id: f"{l.name}  ({l.bar_number})"
+                                   for l in all_lawyers_ec})
 
             with st.form("edit_lawyer_form"):
                 _ec_def = (
@@ -685,6 +741,66 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                         _db.rollback(); st.error(f"Update failed: {e}")
                     finally:
                         _db.close()
+
+            st.divider()
+            st.markdown("**Manage defendants**")
+            st.caption("Add co-defendants or remove a defendant from this case.")
+
+            _db_codef = get_db()
+            all_accused_ec = _db_codef.execute(
+                select(Accused).where(Accused.case_id == ec_case_id).order_by(Accused.id)
+            ).scalars().all()
+            _db_codef.close()
+
+            for _acc in all_accused_ec:
+                _ac1, _ac2, _ac3 = st.columns([3, 2, 1])
+                _ac1.write(f"**{_acc.name}**")
+                _ac2.caption(_acc.phone or "no phone")
+                if len(all_accused_ec) > 1:
+                    if _ac3.button("Remove", key=f"rm_acc_{_acc.id}", use_container_width=True):
+                        _db = get_db()
+                        try:
+                            _db.delete(_db.get(Accused, _acc.id))
+                            audit(_db, "DEFENDANT_REMOVED", ec_case_id, {
+                                "case_number": ec_case.case_number,
+                                "accused_name": _acc.name,
+                            }, entity_type="case")
+                            _db.commit(); st.rerun()
+                        except Exception as e:
+                            _db.rollback(); st.error(f"Remove failed: {e}")
+                        finally:
+                            _db.close()
+                else:
+                    _ac3.caption("primary")
+
+            with st.form("add_codef_form", clear_on_submit=True):
+                cd1, cd2 = st.columns(2)
+                with cd1:
+                    cd_name = st.text_input("Co-defendant name")
+                with cd2:
+                    cd_phone = st.text_input("Phone (optional)")
+                if st.form_submit_button("➕ Add defendant", use_container_width=True):
+                    if not cd_name.strip():
+                        st.error("Name is required.")
+                    else:
+                        _db = get_db()
+                        try:
+                            _db.add(Accused(
+                                name=cd_name.strip(),
+                                case_id=ec_case_id,
+                                phone=cd_phone.strip() or None,
+                            ))
+                            audit(_db, "DEFENDANT_ADDED", ec_case_id, {
+                                "case_number": ec_case.case_number,
+                                "accused_name": cd_name.strip(),
+                            }, entity_type="case")
+                            _db.commit()
+                            st.success(f"✅ **{cd_name.strip()}** added as co-defendant.")
+                            st.rerun()
+                        except Exception as e:
+                            _db.rollback(); st.error(f"Add failed: {e}")
+                        finally:
+                            _db.close()
 
             st.divider()
             st.markdown("**Close case**")
@@ -1116,10 +1232,21 @@ try:
 
             with mid:
                 st.markdown("**Parties**")
-                st.write(f"Accused: {accused.name if accused else 'N/A'}")
-                st.write(f"Lawyer: {lawyer.name if lawyer else 'N/A'}")
-                if lawyer:
-                    st.caption(f"Bar # {lawyer.bar_number}")
+                _all_acc = db.execute(
+                    select(Accused).where(Accused.case_id == case.id).order_by(Accused.id)
+                ).scalars().all()
+                for _i, _acc in enumerate(_all_acc):
+                    _label = "Accused" if _i == 0 else "Co-defendant"
+                    _ph = f" · {_acc.phone}" if _acc.phone else ""
+                    st.write(f"{_label}: {_acc.name}{_ph}")
+                if not _all_acc:
+                    st.write("Accused: N/A")
+                if lawyer and lawyer.bar_number == PRO_SE_BAR:
+                    st.write("Representation: Self-Represented (Pro Se)")
+                else:
+                    st.write(f"Lawyer: {lawyer.name if lawyer else 'N/A'}")
+                    if lawyer:
+                        st.caption(f"Bar # {lawyer.bar_number}")
 
             with right:
                 st.markdown("**Check-in**")

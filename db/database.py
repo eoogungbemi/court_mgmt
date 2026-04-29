@@ -22,17 +22,53 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
 def _apply_migrations() -> None:
-    """Safe ALTER TABLE migrations for columns added after initial release."""
-    stmts = [
-        "ALTER TABLE hearings ADD COLUMN notes TEXT",
-    ]
+    """Safe schema migrations for columns and constraints added after initial release."""
     with engine.connect() as conn:
-        for stmt in stmts:
-            try:
-                conn.execute(text(stmt))
-                conn.commit()
-            except Exception:
-                pass  # column already exists — ignore
+        # 1. hearings.notes column
+        try:
+            conn.execute(text("ALTER TABLE hearings ADD COLUMN notes TEXT"))
+            conn.commit()
+        except Exception:
+            pass
+
+        # 2. Remove UNIQUE constraint from accused.case_id to allow co-defendants.
+        #    Detected by checking for a non-PK unique index on the table.
+        indices = conn.execute(text("PRAGMA index_list(accused)")).fetchall()
+        if any(row[2] == 1 for row in indices):
+            conn.execute(text("DROP TABLE IF EXISTS accused_v2"))
+            conn.execute(text("PRAGMA foreign_keys=OFF"))
+            conn.execute(text("""
+                CREATE TABLE accused_v2 (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR NOT NULL,
+                    case_id INTEGER NOT NULL REFERENCES cases(id),
+                    phone VARCHAR
+                )
+            """))
+            conn.execute(text(
+                "INSERT INTO accused_v2 SELECT id, name, case_id, phone FROM accused"
+            ))
+            conn.execute(text("DROP TABLE accused"))
+            conn.execute(text("ALTER TABLE accused_v2 RENAME TO accused"))
+            conn.execute(text("PRAGMA foreign_keys=ON"))
+            conn.commit()
+
+
+def _ensure_pro_se_lawyer() -> None:
+    """Guarantee a PRO-SE placeholder lawyer exists for self-represented defendants."""
+    from db.models import Lawyer
+    db = SessionLocal()
+    try:
+        if not db.execute(
+            select(Lawyer).where(Lawyer.bar_number == "PRO-SE")
+        ).scalar_one_or_none():
+            db.add(Lawyer(
+                name="Self-Represented (Pro Se)",
+                bar_number="PRO-SE",
+            ))
+            db.commit()
+    finally:
+        db.close()
 
 
 def init_db() -> None:
@@ -45,6 +81,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _apply_migrations()
     _auto_seed_if_empty()
+    _ensure_pro_se_lawyer()
 
 
 def _auto_seed_if_empty() -> None:
