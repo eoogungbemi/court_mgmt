@@ -1,15 +1,17 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from datetime import date, datetime
+import json
+from datetime import date, datetime, time, timedelta
 import streamlit as st
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from db.database import init_db, SessionLocal
 from db.models import (
     Courtroom, Hearing, Case, Accused, Lawyer,
     LawyerConflict, AuditLog,
 )
+from config import HEARING_DURATIONS, COMPLEXITY_MULTIPLIER
 
 st.set_page_config(
     page_title="Clerk Dashboard · Court",
@@ -22,6 +24,67 @@ init_db()
 
 def get_db():
     return SessionLocal()
+
+
+HEARING_TYPES = {
+    "criminal": ["arraignment", "bail_hearing", "preliminary_hearing",
+                 "motion_hearing", "plea_hearing", "sentencing", "bench_trial"],
+    "civil":    ["status_conference", "motion_hearing", "bench_trial"],
+    "traffic":  ["arraignment", "plea_hearing", "bench_trial"],
+}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def next_case_number(db, case_type: str, courtroom_id: int) -> str:
+    prefix = {"criminal": "CR", "civil": "CV", "traffic": "TR"}[case_type]
+    year = date.today().year
+    pattern = f"{year}-{prefix}-%"
+    last = db.execute(
+        select(Case.case_number)
+        .where(Case.case_number.like(pattern))
+        .order_by(Case.id.desc())
+    ).scalar_one_or_none()
+    seq = 1
+    if last:
+        try:
+            seq = int(last.split("-")[2]) + 1
+        except (IndexError, ValueError):
+            seq = 1
+    return f"{year}-{prefix}-{seq:05d}-CR{courtroom_id}"
+
+
+def lawyer_is_free(db, lawyer_id: int, start: datetime, end: datetime,
+                   exclude_hearing_id: int | None = None) -> bool:
+    hearings = db.execute(
+        select(Hearing)
+        .join(Case, Case.id == Hearing.case_id)
+        .where(
+            Case.defense_lawyer_id == lawyer_id,
+            Hearing.status != "cancelled",
+            Hearing.scheduled_start < end,
+            Hearing.scheduled_end > start,
+        )
+    ).scalars().all()
+    clashes = [h for h in hearings if h.id != exclude_hearing_id]
+    return len(clashes) == 0
+
+
+def estimate_duration(case_type: str, hearing_type: str, complexity: str) -> int:
+    lo, hi = HEARING_DURATIONS.get(case_type, {}).get(hearing_type, (20, 40))
+    mult = COMPLEXITY_MULTIPLIER.get(complexity, 1.0)
+    return max(5, int(((lo + hi) / 2) * mult))
+
+
+def audit(db, event_type: str, entity_id: int, payload: dict,
+          entity_type: str = "hearing") -> None:
+    db.add(AuditLog(
+        event_type=event_type,
+        agent_name="ClerkDashboard",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        payload=json.dumps(payload),
+    ))
 
 
 # ── Sidebar controls ──────────────────────────────────────────────────────────
@@ -62,13 +125,11 @@ try:
     all_conflicts = db.execute(
         select(LawyerConflict).where(LawyerConflict.resolved == False)
     ).scalars().all()
-
     day_conflicts = [
         c for c in all_conflicts
         if (h := db.get(Hearing, c.hearing_a_id)) and
         h.scheduled_start.date() == run_date
     ]
-
     if day_conflicts:
         st.error(
             f"⚠️  **{len(day_conflicts)} unresolved lawyer conflict(s) today.** "
@@ -76,11 +137,363 @@ try:
         )
     else:
         st.success("✅ No lawyer conflicts detected for today.")
-
 finally:
     db.close()
 
-# ── Docket ────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CASE MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+with st.expander("📁 Case Management — Add · Reschedule · Remove", expanded=False):
+
+    add_tab, reschedule_tab, remove_tab = st.tabs([
+        "➕  Add Case",
+        "🕐  Set / Change Time",
+        "🗑️  Remove Case",
+    ])
+
+    # ── ADD CASE ──────────────────────────────────────────────────────────────
+    with add_tab:
+        st.markdown("**Add a new case and hearing to the docket**")
+        st.caption(
+            "Creates a Case, Accused, and Hearing record. "
+            "The case number is generated automatically."
+        )
+
+        with st.form("add_case_form", clear_on_submit=True):
+            a1, a2 = st.columns(2)
+
+            with a1:
+                ac_case_type = st.selectbox(
+                    "Case type",
+                    ["criminal", "civil", "traffic"],
+                    format_func=str.title,
+                )
+                ac_hearing_type = st.selectbox(
+                    "Hearing type",
+                    HEARING_TYPES[ac_case_type],
+                    format_func=lambda s: s.replace("_", " ").title(),
+                )
+                ac_complexity = st.selectbox(
+                    "Complexity",
+                    ["low", "medium", "high"],
+                    index=1,
+                    format_func=str.title,
+                )
+
+            with a2:
+                ac_accused = st.text_input("Accused full name")
+                ac_date    = st.date_input("Hearing date", value=run_date,
+                                           key="ac_date")
+                ac_time    = st.time_input("Start time",
+                                           value=time(9, 0), step=300,
+                                           key="ac_time")
+
+            # Lawyer selector — full list from DB
+            _db_l = get_db()
+            all_lawyers = _db_l.execute(
+                select(Lawyer).order_by(Lawyer.name)
+            ).scalars().all()
+            _db_l.close()
+
+            lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})"
+                           for l in all_lawyers}
+            ac_lawyer_id = st.selectbox(
+                "Defence lawyer",
+                options=list(lawyer_opts.keys()),
+                format_func=lambda x: lawyer_opts[x],
+            )
+
+            submitted = st.form_submit_button(
+                "Add to Docket", type="primary", use_container_width=True
+            )
+
+        if submitted:
+            if not ac_accused.strip():
+                st.error("Accused name is required.")
+            else:
+                _db = get_db()
+                try:
+                    start_dt = datetime.combine(ac_date, ac_time)
+                    dur      = estimate_duration(ac_case_type, ac_hearing_type,
+                                                 ac_complexity)
+                    end_dt   = start_dt + timedelta(minutes=dur)
+
+                    # Conflict check
+                    free = lawyer_is_free(_db, ac_lawyer_id, start_dt, end_dt)
+                    if not free:
+                        lawyer_name = lawyer_opts[ac_lawyer_id].split("  ")[0]
+                        st.warning(
+                            f"⚠️ **{lawyer_name}** already has a hearing "
+                            f"overlapping {start_dt.strftime('%-I:%M %p')}–"
+                            f"{end_dt.strftime('%-I:%M %p')}. "
+                            "Case added but a conflict will be flagged."
+                        )
+
+                    courtroom = _db.get(Courtroom, selected_id)
+                    case_num  = next_case_number(_db, ac_case_type, selected_id)
+
+                    new_case = Case(
+                        case_number=case_num,
+                        case_type=ac_case_type,
+                        complexity=ac_complexity,
+                        status="active",
+                        defense_lawyer_id=ac_lawyer_id,
+                    )
+                    _db.add(new_case)
+                    _db.flush()
+
+                    _db.add(Accused(
+                        name=ac_accused.strip(),
+                        case_id=new_case.id,
+                    ))
+
+                    new_hearing = Hearing(
+                        case_id=new_case.id,
+                        courtroom_id=selected_id,
+                        judge_id=courtroom.judge.id,
+                        hearing_type=ac_hearing_type,
+                        scheduled_start=start_dt,
+                        scheduled_end=end_dt,
+                        estimated_duration_mins=dur,
+                        status="scheduled",
+                    )
+                    _db.add(new_hearing)
+                    _db.flush()
+
+                    audit(_db, "HEARING_ADDED", new_hearing.id, {
+                        "case_number": case_num,
+                        "case_type":   ac_case_type,
+                        "hearing_type": ac_hearing_type,
+                        "start": start_dt.isoformat(),
+                        "lawyer_id": ac_lawyer_id,
+                    })
+                    _db.commit()
+                    st.success(
+                        f"✅ Case **{case_num}** added — "
+                        f"{ac_hearing_type.replace('_', ' ').title()} at "
+                        f"{start_dt.strftime('%-I:%M %p')} "
+                        f"(est. {dur} min)"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    _db.rollback()
+                    st.error(f"Failed to add case: {e}")
+                finally:
+                    _db.close()
+
+    # ── RESCHEDULE / SET TIME ─────────────────────────────────────────────────
+    with reschedule_tab:
+        st.markdown("**Change the scheduled start time for a hearing**")
+        st.caption(
+            "Updates both the start and end times. "
+            "Checks for lawyer conflicts at the new time."
+        )
+
+        _db_r = get_db()
+        reschedule_hearings = _db_r.execute(
+            select(Hearing)
+            .where(
+                Hearing.courtroom_id == selected_id,
+                Hearing.status.in_(["scheduled", "delayed"]),
+            )
+            .order_by(Hearing.scheduled_start)
+        ).scalars().all()
+        rs_day = [h for h in reschedule_hearings
+                  if h.scheduled_start.date() == run_date]
+        _db_r.close()
+
+        if not rs_day:
+            st.info("No reschedulable hearings for the selected courtroom and date.")
+        else:
+            rs_opts = {
+                h.id: (
+                    f"{h.scheduled_start.strftime('%-I:%M %p')} · "
+                    f"{h.case.case_number} · "
+                    f"{h.hearing_type.replace('_', ' ').title()}"
+                )
+                for h in rs_day
+            }
+
+            with st.form("reschedule_form", clear_on_submit=False):
+                rs_hearing_id = st.selectbox(
+                    "Select hearing",
+                    options=list(rs_opts.keys()),
+                    format_func=lambda x: rs_opts[x],
+                )
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    rs_date = st.date_input("New date", value=run_date,
+                                            key="rs_date")
+                with rc2:
+                    rs_time = st.time_input("New start time",
+                                            value=time(9, 0), step=300,
+                                            key="rs_time")
+
+                rs_submitted = st.form_submit_button(
+                    "Apply New Time", type="primary", use_container_width=True
+                )
+
+            if rs_submitted:
+                _db = get_db()
+                try:
+                    h = _db.get(Hearing, rs_hearing_id)
+                    old_start = h.scheduled_start
+                    new_start = datetime.combine(rs_date, rs_time)
+                    new_end   = new_start + timedelta(
+                        minutes=h.estimated_duration_mins
+                    )
+
+                    lawyer_id = h.case.defense_lawyer_id
+                    free = lawyer_is_free(_db, lawyer_id, new_start, new_end,
+                                         exclude_hearing_id=h.id)
+                    if not free:
+                        st.warning(
+                            f"⚠️ Lawyer has a conflict at the new time. "
+                            "Time updated — conflict will be flagged."
+                        )
+
+                    h.scheduled_start = new_start
+                    h.scheduled_end   = new_end
+                    if h.status == "delayed":
+                        h.status = "scheduled"
+
+                    audit(_db, "HEARING_RESCHEDULED", h.id, {
+                        "old_start": old_start.isoformat(),
+                        "new_start": new_start.isoformat(),
+                    })
+                    _db.commit()
+                    st.success(
+                        f"✅ **{h.case.case_number}** rescheduled to "
+                        f"{new_start.strftime('%-I:%M %p on %A, %b %d')}"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    _db.rollback()
+                    st.error(f"Reschedule failed: {e}")
+                finally:
+                    _db.close()
+
+    # ── REMOVE CASE ───────────────────────────────────────────────────────────
+    with remove_tab:
+        st.markdown("**Cancel a hearing or remove a case from the docket**")
+        st.caption(
+            "Cancelling a hearing keeps the record and audit trail intact. "
+            "Removing a case permanently deletes it and all its hearings."
+        )
+
+        _db_rm = get_db()
+        removable = _db_rm.execute(
+            select(Hearing)
+            .where(
+                Hearing.courtroom_id == selected_id,
+                Hearing.status != "cancelled",
+            )
+            .order_by(Hearing.scheduled_start)
+        ).scalars().all()
+        rm_day = [h for h in removable if h.scheduled_start.date() == run_date]
+        _db_rm.close()
+
+        if not rm_day:
+            st.info("No active hearings for the selected courtroom and date.")
+        else:
+            rm_opts = {
+                h.id: (
+                    f"{h.scheduled_start.strftime('%-I:%M %p')} · "
+                    f"{h.case.case_number} · "
+                    f"{h.hearing_type.replace('_', ' ').title()}"
+                )
+                for h in rm_day
+            }
+
+            rm_hearing_id = st.selectbox(
+                "Select hearing",
+                options=list(rm_opts.keys()),
+                format_func=lambda x: rm_opts[x],
+                key="rm_select",
+            )
+
+            rm_action = st.radio(
+                "Action",
+                ["Cancel hearing only", "Remove case entirely"],
+                horizontal=True,
+                key="rm_action",
+            )
+
+            st.warning(
+                "**Cancel hearing** sets status to Cancelled — record is kept. \n\n"
+                "**Remove case** permanently deletes the case, accused, and all "
+                "its hearings. This cannot be undone."
+            )
+
+            confirm = st.checkbox("I confirm this action", key="rm_confirm")
+
+            if st.button("Apply", type="primary",
+                         disabled=not confirm, key="rm_apply",
+                         use_container_width=True):
+                _db = get_db()
+                try:
+                    h = _db.get(Hearing, rm_hearing_id)
+                    case_num = h.case.case_number
+
+                    if rm_action == "Cancel hearing only":
+                        h.status = "cancelled"
+                        audit(_db, "HEARING_CANCELLED", h.id, {
+                            "case_number": case_num,
+                            "reason": "Cancelled by clerk",
+                        })
+                        _db.commit()
+                        st.success(f"✅ Hearing for **{case_num}** cancelled.")
+
+                    else:
+                        # Remove all hearings for this case then the case itself
+                        case_obj = h.case
+                        hearing_ids = [hh.id for hh in case_obj.hearings]
+
+                        # Clear related records
+                        from sqlalchemy import text
+                        if hearing_ids:
+                            ph = ",".join(str(i) for i in hearing_ids)
+                            _db.execute(text(
+                                f"DELETE FROM lawyer_conflicts "
+                                f"WHERE hearing_a_id IN ({ph}) "
+                                f"OR hearing_b_id IN ({ph})"
+                            ))
+                            _db.execute(text(
+                                f"DELETE FROM eta_estimates "
+                                f"WHERE hearing_id IN ({ph})"
+                            ))
+
+                        audit(_db, "CASE_REMOVED", h.id, {
+                            "case_number": case_num,
+                            "case_type": case_obj.case_type,
+                        })
+                        _db.flush()
+
+                        for hh in list(case_obj.hearings):
+                            _db.delete(hh)
+                        if case_obj.accused:
+                            _db.delete(case_obj.accused)
+                        _db.delete(case_obj)
+                        _db.commit()
+                        st.success(
+                            f"✅ Case **{case_num}** and all its hearings removed."
+                        )
+
+                    st.rerun()
+                except Exception as e:
+                    _db.rollback()
+                    st.error(f"Action failed: {e}")
+                finally:
+                    _db.close()
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOCKET
+# ══════════════════════════════════════════════════════════════════════════════
+
 db = get_db()
 try:
     hearings = db.execute(
@@ -94,22 +507,23 @@ try:
         st.info("No hearings scheduled for this courtroom on the selected date.")
         st.stop()
 
-    # Summary row
     total = len(day_hearings)
     done  = sum(1 for h in day_hearings if h.status == "completed")
     live  = sum(1 for h in day_hearings if h.status == "in_progress")
     sched = sum(1 for h in day_hearings if h.status == "scheduled")
+    canc  = sum(1 for h in day_hearings if h.status == "cancelled")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total hearings", total)
-    m2.metric("Completed",      done)
-    m3.metric("In progress",    live)
-    m4.metric("Remaining",      sched)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total",       total)
+    m2.metric("Remaining",   sched)
+    m3.metric("In Progress", live)
+    m4.metric("Completed",   done)
+    m5.metric("Cancelled",   canc)
     st.divider()
 
     for h in day_hearings:
-        case: Case   = h.case
-        lawyer: Lawyer  = case.defense_lawyer
+        case: Case     = h.case
+        lawyer: Lawyer = case.defense_lawyer
         accused: Accused = case.accused
 
         badge = {
@@ -149,26 +563,21 @@ try:
 
             with right:
                 st.markdown("**Check-in**")
-                lawyer_ok  = h.lawyer_checked_in
-                accused_ok = h.accused_checked_in
-
-                if not lawyer_ok:
+                if not h.lawyer_checked_in:
                     if st.button("✅ Lawyer arrived", key=f"l_{h.id}",
                                  use_container_width=True):
                         _db = get_db()
                         _db.get(Hearing, h.id).lawyer_checked_in = True
-                        _db.commit(); _db.close()
-                        st.rerun()
+                        _db.commit(); _db.close(); st.rerun()
                 else:
                     st.success("Lawyer ✓ checked in")
 
-                if not accused_ok:
+                if not h.accused_checked_in:
                     if st.button("✅ Accused arrived", key=f"a_{h.id}",
                                  use_container_width=True):
                         _db = get_db()
                         _db.get(Hearing, h.id).accused_checked_in = True
-                        _db.commit(); _db.close()
-                        st.rerun()
+                        _db.commit(); _db.close(); st.rerun()
                 else:
                     st.success("Accused ✓ checked in")
 
@@ -179,8 +588,7 @@ try:
             sc1, sc2 = st.columns([3, 1])
             with sc1:
                 new_status = st.selectbox(
-                    "Update status",
-                    status_opts,
+                    "Update status", status_opts,
                     index=status_opts.index(h.status),
                     key=f"s_{h.id}",
                     label_visibility="collapsed",
@@ -194,10 +602,9 @@ try:
                         h2.actual_start = datetime.now()
                     if new_status == "completed" and not h2.actual_end:
                         h2.actual_end = datetime.now()
-                    _db.commit(); _db.close()
-                    st.rerun()
+                    _db.commit(); _db.close(); st.rerun()
 
-            # Conflict details for this hearing
+            # Conflict details
             db2 = get_db()
             hearing_conflicts = db2.execute(
                 select(LawyerConflict).where(
@@ -215,10 +622,9 @@ try:
                         else c.hearing_a_id
                     )
                     db3 = get_db()
-                    other = db3.get(Hearing, other_id)
+                    other      = db3.get(Hearing, other_id)
                     other_room = db3.get(Courtroom, other.courtroom_id) if other else None
                     db3.close()
-
                     st.warning(
                         f"⚠️ **{lawyer.name}** also scheduled in "
                         f"**{other_room.name if other_room else '?'}** "
@@ -226,12 +632,11 @@ try:
                         f"(overlap {c.overlap_start.strftime('%-I:%M')}–"
                         f"{c.overlap_end.strftime('%-I:%M %p')})"
                     )
-                    if st.button(f"Mark resolved", key=f"res_{c.id}",
+                    if st.button("Mark resolved", key=f"res_{c.id}",
                                  use_container_width=True):
                         _db = get_db()
                         _db.get(LawyerConflict, c.id).resolved = True
-                        _db.commit(); _db.close()
-                        st.rerun()
+                        _db.commit(); _db.close(); st.rerun()
 
             # Audit trail
             with st.expander("📋 Audit trail"):
@@ -243,7 +648,6 @@ try:
                     .order_by(AuditLog.created_at)
                 ).scalars().all()
                 db4.close()
-
                 if audit_rows:
                     for r in audit_rows:
                         st.caption(
