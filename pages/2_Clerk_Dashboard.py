@@ -6,7 +6,7 @@ import json
 from datetime import date, datetime, time, timedelta
 import pandas as pd
 import streamlit as st
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 
 from db.database import init_db, SessionLocal
 from db.models import (
@@ -36,7 +36,7 @@ HEARING_TYPES = {
 }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def next_case_number(db, case_type: str, courtroom_id: int) -> str:
     prefix = {"criminal": "CR", "civil": "CV", "traffic": "TR"}[case_type]
@@ -68,8 +68,7 @@ def lawyer_is_free(db, lawyer_id: int, start: datetime, end: datetime,
             Hearing.scheduled_end > start,
         )
     ).scalars().all()
-    clashes = [h for h in hearings if h.id != exclude_hearing_id]
-    return len(clashes) == 0
+    return len([h for h in hearings if h.id != exclude_hearing_id]) == 0
 
 
 def estimate_duration(case_type: str, hearing_type: str, complexity: str) -> int:
@@ -89,7 +88,21 @@ def audit(db, event_type: str, entity_id: int, payload: dict,
     ))
 
 
-# ── Sidebar controls ──────────────────────────────────────────────────────────
+def _avail_table(all_lawyers, check_start: datetime, check_end: datetime) -> pd.DataFrame:
+    """Return a DataFrame showing free/busy status for every lawyer."""
+    _db = get_db()
+    rows = []
+    try:
+        for l in all_lawyers:
+            free = lawyer_is_free(_db, l.id, check_start, check_end)
+            rows.append({"Lawyer": l.name, "Bar #": l.bar_number,
+                         "Status": "✅ Free" if free else "🔴 Busy"})
+    finally:
+        _db.close()
+    return pd.DataFrame(rows)
+
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 st.sidebar.markdown("## 🗂️ Clerk Dashboard")
 st.sidebar.page_link("Home.py", label="← Back to Home", icon="⚖️")
 st.sidebar.divider()
@@ -116,12 +129,71 @@ st.sidebar.markdown(
     "🟠 Delayed &nbsp; ✅ Completed"
 )
 
-# ── Page header ───────────────────────────────────────────────────────────────
+# ── Page header ────────────────────────────────────────────────────────────────
 st.markdown(f"## 🗂️ {room_map[selected_id]}")
 st.caption(f"{run_date.strftime('%A, %B %d %Y')}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CASE SEARCH  [blocking gap #3]
+# ══════════════════════════════════════════════════════════════════════════════
+
+with st.expander("🔍 Case Search — find by case number, accused, or lawyer", expanded=False):
+    search_q = st.text_input(
+        "Search",
+        placeholder="e.g.  2026-CR-00042   or   Jane Smith   or   counsel name",
+        key="case_search_q",
+        label_visibility="collapsed",
+    )
+    if search_q.strip():
+        _pat = f"%{search_q.strip()}%"
+        _db_sr = get_db()
+        try:
+            hits = _db_sr.execute(
+                select(Case)
+                .join(Accused, Accused.case_id == Case.id, isouter=True)
+                .join(Lawyer, Lawyer.id == Case.defense_lawyer_id, isouter=True)
+                .where(or_(
+                    Case.case_number.ilike(_pat),
+                    Accused.name.ilike(_pat),
+                    Lawyer.name.ilike(_pat),
+                ))
+                .order_by(Case.id.desc())
+            ).scalars().unique().all()
+
+            if not hits:
+                st.info("No matching cases found.")
+            else:
+                st.caption(f"{len(hits)} result(s):")
+                for mc in hits:
+                    nh = _db_sr.execute(
+                        select(Hearing)
+                        .where(
+                            Hearing.case_id == mc.id,
+                            Hearing.status.in_(["scheduled", "delayed", "in_progress"]),
+                        )
+                        .order_by(Hearing.scheduled_start)
+                    ).scalars().first()
+                    with st.container(border=True):
+                        r1, r2, r3, r4 = st.columns([2, 2, 2, 1])
+                        r1.markdown(f"**{mc.case_number}**")
+                        r2.write(mc.accused.name if mc.accused else "—")
+                        r3.write(mc.defense_lawyer.name if mc.defense_lawyer else "—")
+                        r4.write(f"{'🟢' if mc.status == 'active' else '⬛'} {mc.status.title()}")
+                        if nh:
+                            nh_room = _db_sr.get(Courtroom, nh.courtroom_id)
+                            st.caption(
+                                f"Next: **{nh.hearing_type.replace('_', ' ').title()}** · "
+                                f"{nh.scheduled_start.strftime('%a %b %d %Y, %-I:%M %p')} · "
+                                f"{nh_room.name if nh_room else '?'}"
+                            )
+                        else:
+                            st.caption("No upcoming hearings.")
+        finally:
+            _db_sr.close()
+
 st.divider()
 
-# ── Conflict banner ───────────────────────────────────────────────────────────
+# ── Conflict banner ────────────────────────────────────────────────────────────
 db = get_db()
 try:
     all_conflicts = db.execute(
@@ -147,142 +219,271 @@ finally:
 # CASE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk Upload", expanded=False):
+with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edit · Remove · Bulk", expanded=False):
 
-    add_tab, reschedule_tab, remove_tab, bulk_tab = st.tabs([
+    (add_tab, followup_tab, reschedule_tab,
+     edit_tab, remove_tab, bulk_tab) = st.tabs([
         "➕  Add Case",
+        "🔁  Follow-up Hearing",
         "🕐  Set / Change Time",
+        "✏️  Edit Case",
         "🗑️  Remove Case",
         "📤  Bulk Upload",
     ])
 
     # ── ADD CASE ──────────────────────────────────────────────────────────────
     with add_tab:
-        st.markdown("**Add a new case and hearing to the docket**")
-        st.caption(
-            "Creates a Case, Accused, and Hearing record. "
-            "The case number is generated automatically."
-        )
+        st.markdown("**Add a new case and first hearing to the docket**")
+        st.caption("The case number is generated automatically.")
 
         with st.form("add_case_form", clear_on_submit=True):
             a1, a2 = st.columns(2)
-
             with a1:
                 ac_case_type = st.selectbox(
-                    "Case type",
-                    ["criminal", "civil", "traffic"],
-                    format_func=str.title,
+                    "Case type", ["criminal", "civil", "traffic"], format_func=str.title,
                 )
                 ac_hearing_type = st.selectbox(
-                    "Hearing type",
-                    HEARING_TYPES[ac_case_type],
+                    "Hearing type", HEARING_TYPES[ac_case_type],
                     format_func=lambda s: s.replace("_", " ").title(),
                 )
                 ac_complexity = st.selectbox(
-                    "Complexity",
-                    ["low", "medium", "high"],
-                    index=1,
-                    format_func=str.title,
+                    "Complexity", ["low", "medium", "high"], index=1, format_func=str.title,
                 )
-
             with a2:
                 ac_accused = st.text_input("Accused full name")
-                ac_date    = st.date_input("Hearing date", value=run_date,
-                                           key="ac_date")
-                ac_time    = st.time_input("Start time",
-                                           value=time(9, 0), step=300,
-                                           key="ac_time")
+                ac_date = st.date_input("Hearing date", value=run_date, key="ac_date")
+                ac_time = st.time_input("Start time", value=time(9, 0), step=300, key="ac_time")
 
-            # Lawyer selector — full list from DB
-            _db_l = get_db()
-            all_lawyers = _db_l.execute(
+            _db_acl = get_db()
+            _all_lawyers = _db_acl.execute(
                 select(Lawyer).order_by(Lawyer.name)
             ).scalars().all()
-            _db_l.close()
-
-            lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})"
-                           for l in all_lawyers}
+            _db_acl.close()
+            lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})" for l in _all_lawyers}
             ac_lawyer_id = st.selectbox(
                 "Defence lawyer",
                 options=list(lawyer_opts.keys()),
                 format_func=lambda x: lawyer_opts[x],
             )
-
-            submitted = st.form_submit_button(
+            ac_submitted = st.form_submit_button(
                 "Add to Docket", type="primary", use_container_width=True
             )
 
-        if submitted:
+        # Availability checker — outside form so it's reactive  [blocking gap #4]
+        with st.expander("🗓️ Check lawyer availability at a time", expanded=False):
+            av1, av2 = st.columns(2)
+            with av1:
+                chk_date_ac = st.date_input("Date", value=run_date, key="chk_date_ac")
+            with av2:
+                chk_time_ac = st.time_input("Time", value=time(9, 0), step=300, key="chk_time_ac")
+            _chk_s = datetime.combine(chk_date_ac, chk_time_ac)
+            st.dataframe(
+                _avail_table(_all_lawyers, _chk_s, _chk_s + timedelta(hours=1)),
+                use_container_width=True, hide_index=True,
+                column_config={"Status": st.column_config.TextColumn(width="small")},
+            )
+
+        if ac_submitted:
             if not ac_accused.strip():
                 st.error("Accused name is required.")
             else:
                 _db = get_db()
                 try:
                     start_dt = datetime.combine(ac_date, ac_time)
-                    dur      = estimate_duration(ac_case_type, ac_hearing_type,
-                                                 ac_complexity)
-                    end_dt   = start_dt + timedelta(minutes=dur)
-
-                    # Conflict check
-                    free = lawyer_is_free(_db, ac_lawyer_id, start_dt, end_dt)
-                    if not free:
-                        lawyer_name = lawyer_opts[ac_lawyer_id].split("  ")[0]
+                    dur = estimate_duration(ac_case_type, ac_hearing_type, ac_complexity)
+                    end_dt = start_dt + timedelta(minutes=dur)
+                    if not lawyer_is_free(_db, ac_lawyer_id, start_dt, end_dt):
                         st.warning(
-                            f"⚠️ **{lawyer_name}** already has a hearing "
-                            f"overlapping {start_dt.strftime('%-I:%M %p')}–"
-                            f"{end_dt.strftime('%-I:%M %p')}. "
-                            "Case added but a conflict will be flagged."
+                            f"⚠️ **{lawyer_opts[ac_lawyer_id].split('  ')[0]}** has a "
+                            f"conflict at {start_dt.strftime('%-I:%M %p')}. "
+                            "Case added — conflict flagged."
                         )
-
                     courtroom = _db.get(Courtroom, selected_id)
-                    case_num  = next_case_number(_db, ac_case_type, selected_id)
-
+                    case_num = next_case_number(_db, ac_case_type, selected_id)
                     new_case = Case(
-                        case_number=case_num,
-                        case_type=ac_case_type,
-                        complexity=ac_complexity,
-                        status="active",
+                        case_number=case_num, case_type=ac_case_type,
+                        complexity=ac_complexity, status="active",
                         defense_lawyer_id=ac_lawyer_id,
                     )
-                    _db.add(new_case)
-                    _db.flush()
-
-                    _db.add(Accused(
-                        name=ac_accused.strip(),
-                        case_id=new_case.id,
-                    ))
-
+                    _db.add(new_case); _db.flush()
+                    _db.add(Accused(name=ac_accused.strip(), case_id=new_case.id))
                     new_hearing = Hearing(
-                        case_id=new_case.id,
-                        courtroom_id=selected_id,
-                        judge_id=courtroom.judge.id,
-                        hearing_type=ac_hearing_type,
-                        scheduled_start=start_dt,
-                        scheduled_end=end_dt,
-                        estimated_duration_mins=dur,
-                        status="scheduled",
+                        case_id=new_case.id, courtroom_id=selected_id,
+                        judge_id=courtroom.judge.id, hearing_type=ac_hearing_type,
+                        scheduled_start=start_dt, scheduled_end=end_dt,
+                        estimated_duration_mins=dur, status="scheduled",
                     )
-                    _db.add(new_hearing)
-                    _db.flush()
-
+                    _db.add(new_hearing); _db.flush()
                     audit(_db, "HEARING_ADDED", new_hearing.id, {
-                        "case_number": case_num,
-                        "case_type":   ac_case_type,
-                        "hearing_type": ac_hearing_type,
-                        "start": start_dt.isoformat(),
+                        "case_number": case_num, "case_type": ac_case_type,
+                        "hearing_type": ac_hearing_type, "start": start_dt.isoformat(),
                         "lawyer_id": ac_lawyer_id,
                     })
                     _db.commit()
                     st.success(
                         f"✅ Case **{case_num}** added — "
                         f"{ac_hearing_type.replace('_', ' ').title()} at "
-                        f"{start_dt.strftime('%-I:%M %p')} "
-                        f"(est. {dur} min)"
+                        f"{start_dt.strftime('%-I:%M %p')} (est. {dur} min)"
                     )
                     st.rerun()
                 except Exception as e:
-                    _db.rollback()
-                    st.error(f"Failed to add case: {e}")
+                    _db.rollback(); st.error(f"Failed to add case: {e}")
+                finally:
+                    _db.close()
+
+    # ── FOLLOW-UP HEARING  [blocking gap #1] ──────────────────────────────────
+    with followup_tab:
+        st.markdown("**Schedule a next hearing on an existing case**")
+        st.caption(
+            "Use this for continuances, next appearances, and follow-up motions. "
+            "The case record is reused — no new case number is generated."
+        )
+
+        _db_fu = get_db()
+        active_cases = _db_fu.execute(
+            select(Case).where(Case.status == "active").order_by(Case.case_number)
+        ).scalars().all()
+        _db_fu.close()
+
+        if not active_cases:
+            st.info("No active cases found.")
+        else:
+            fu_case_opts = {
+                c.id: (f"{c.case_number} · "
+                       f"{c.accused.name if c.accused else '?'} · "
+                       f"{c.case_type.title()}")
+                for c in active_cases
+            }
+            fu_case_id = st.selectbox(
+                "Select case",
+                options=list(fu_case_opts.keys()),
+                format_func=lambda x: fu_case_opts[x],
+                key="fu_case_select",
+            )
+            sel_case = next(c for c in active_cases if c.id == fu_case_id)
+
+            fc1, fc2, fc3 = st.columns(3)
+            fc1.metric("Case type", sel_case.case_type.title())
+            fc2.metric("Complexity", sel_case.complexity.title())
+            fc3.metric("Current lawyer",
+                       sel_case.defense_lawyer.name if sel_case.defense_lawyer else "—")
+
+            _db_fh = get_db()
+            prior = _db_fh.execute(
+                select(Hearing).where(Hearing.case_id == fu_case_id)
+                .order_by(Hearing.scheduled_start)
+            ).scalars().all()
+            _db_fh.close()
+
+            if prior:
+                st.caption("Hearing history:")
+                _BADGE = {"scheduled": "🔵", "completed": "✅", "cancelled": "❌",
+                          "in_progress": "🟢", "delayed": "🟠"}
+                for ph in prior:
+                    b = _BADGE.get(ph.status, "⚪")
+                    st.caption(
+                        f"  {b}  {ph.scheduled_start.strftime('%b %d %Y, %-I:%M %p')} · "
+                        f"{ph.hearing_type.replace('_', ' ').title()} · {ph.status.title()}"
+                    )
+
+            st.divider()
+
+            fu_c1, fu_c2 = st.columns(2)
+            with fu_c1:
+                fu_date = st.date_input("Hearing date", value=run_date, key="fu_date")
+            with fu_c2:
+                fu_time = st.time_input("Start time", value=time(9, 0), step=300, key="fu_time")
+            fu_start = datetime.combine(fu_date, fu_time)
+
+            _db_flaw = get_db()
+            all_lawyers_fu = _db_flaw.execute(
+                select(Lawyer).order_by(Lawyer.name)
+            ).scalars().all()
+            _db_flaw.close()
+
+            with st.expander("🗓️ Check lawyer availability at this time", expanded=False):
+                st.dataframe(
+                    _avail_table(all_lawyers_fu, fu_start, fu_start + timedelta(hours=1)),
+                    use_container_width=True, hide_index=True,
+                    column_config={"Status": st.column_config.TextColumn(width="small")},
+                )
+
+            with st.form("followup_form", clear_on_submit=True):
+                ff1, ff2 = st.columns(2)
+                with ff1:
+                    fu_hearing_type = st.selectbox(
+                        "Hearing type",
+                        HEARING_TYPES[sel_case.case_type],
+                        format_func=lambda s: s.replace("_", " ").title(),
+                    )
+                with ff2:
+                    fu_complexity = st.selectbox(
+                        "Complexity",
+                        ["low", "medium", "high"],
+                        index=["low", "medium", "high"].index(sel_case.complexity),
+                        format_func=str.title,
+                    )
+                fu_lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})"
+                                  for l in all_lawyers_fu}
+                _def_idx = (
+                    list(fu_lawyer_opts.keys()).index(sel_case.defense_lawyer_id)
+                    if sel_case.defense_lawyer_id in fu_lawyer_opts else 0
+                )
+                fu_lawyer_id = st.selectbox(
+                    "Defence lawyer",
+                    options=list(fu_lawyer_opts.keys()),
+                    index=_def_idx,
+                    format_func=lambda x: fu_lawyer_opts[x],
+                )
+                fu_submitted = st.form_submit_button(
+                    "Schedule Hearing", type="primary", use_container_width=True
+                )
+
+            if fu_submitted:
+                _db = get_db()
+                try:
+                    dur = estimate_duration(sel_case.case_type, fu_hearing_type, fu_complexity)
+                    end_dt = fu_start + timedelta(minutes=dur)
+                    if not lawyer_is_free(_db, fu_lawyer_id, fu_start, end_dt):
+                        st.warning(
+                            f"⚠️ **{fu_lawyer_opts[fu_lawyer_id].split('  ')[0]}** has a "
+                            f"conflict at {fu_start.strftime('%-I:%M %p')}. "
+                            "Hearing added — conflict flagged."
+                        )
+                    _cr_id = prior[-1].courtroom_id if prior else selected_id
+                    cr_obj = _db.get(Courtroom, _cr_id)
+                    new_h = Hearing(
+                        case_id=fu_case_id, courtroom_id=_cr_id,
+                        judge_id=cr_obj.judge.id, hearing_type=fu_hearing_type,
+                        scheduled_start=fu_start, scheduled_end=end_dt,
+                        estimated_duration_mins=dur, status="scheduled",
+                    )
+                    _db.add(new_h); _db.flush()
+
+                    if fu_lawyer_id != sel_case.defense_lawyer_id:
+                        old_lid = sel_case.defense_lawyer_id
+                        _db.get(Case, fu_case_id).defense_lawyer_id = fu_lawyer_id
+                        audit(_db, "LAWYER_CHANGED", fu_case_id, {
+                            "case_number": sel_case.case_number,
+                            "old_lawyer_id": old_lid, "new_lawyer_id": fu_lawyer_id,
+                        }, entity_type="case")
+
+                    audit(_db, "HEARING_ADDED", new_h.id, {
+                        "case_number": sel_case.case_number,
+                        "case_type": sel_case.case_type,
+                        "hearing_type": fu_hearing_type,
+                        "start": fu_start.isoformat(),
+                        "lawyer_id": fu_lawyer_id, "followup": True,
+                    })
+                    _db.commit()
+                    st.success(
+                        f"✅ **{fu_hearing_type.replace('_', ' ').title()}** added to "
+                        f"**{sel_case.case_number}** — "
+                        f"{fu_start.strftime('%B %d, %Y at %-I:%M %p')} (est. {dur} min)"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    _db.rollback(); st.error(f"Failed to schedule hearing: {e}")
                 finally:
                     _db.close()
 
@@ -290,12 +491,11 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
     with reschedule_tab:
         st.markdown("**Change the scheduled start time for a hearing**")
         st.caption(
-            "Updates both the start and end times. "
+            "Updates both start and end times. "
             "Checks for lawyer conflicts at the new time."
         )
-
         _db_r = get_db()
-        reschedule_hearings = _db_r.execute(
+        rs_hearings = _db_r.execute(
             select(Hearing)
             .where(
                 Hearing.courtroom_id == selected_id,
@@ -303,8 +503,7 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
             )
             .order_by(Hearing.scheduled_start)
         ).scalars().all()
-        rs_day = [h for h in reschedule_hearings
-                  if h.scheduled_start.date() == run_date]
+        rs_day = [h for h in rs_hearings if h.scheduled_start.date() == run_date]
         _db_r.close()
 
         if not rs_day:
@@ -318,7 +517,6 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                 )
                 for h in rs_day
             }
-
             with st.form("reschedule_form", clear_on_submit=False):
                 rs_hearing_id = st.selectbox(
                     "Select hearing",
@@ -327,41 +525,28 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                 )
                 rc1, rc2 = st.columns(2)
                 with rc1:
-                    rs_date = st.date_input("New date", value=run_date,
-                                            key="rs_date")
+                    rs_date = st.date_input("New date", value=run_date, key="rs_date")
                 with rc2:
-                    rs_time = st.time_input("New start time",
-                                            value=time(9, 0), step=300,
-                                            key="rs_time")
-
+                    rs_time = st.time_input("New start time", value=time(9, 0),
+                                            step=300, key="rs_time")
                 rs_submitted = st.form_submit_button(
                     "Apply New Time", type="primary", use_container_width=True
                 )
-
             if rs_submitted:
                 _db = get_db()
                 try:
                     h = _db.get(Hearing, rs_hearing_id)
                     old_start = h.scheduled_start
                     new_start = datetime.combine(rs_date, rs_time)
-                    new_end   = new_start + timedelta(
-                        minutes=h.estimated_duration_mins
-                    )
-
-                    lawyer_id = h.case.defense_lawyer_id
-                    free = lawyer_is_free(_db, lawyer_id, new_start, new_end,
-                                         exclude_hearing_id=h.id)
-                    if not free:
-                        st.warning(
-                            f"⚠️ Lawyer has a conflict at the new time. "
-                            "Time updated — conflict will be flagged."
-                        )
-
+                    new_end = new_start + timedelta(minutes=h.estimated_duration_mins)
+                    if not lawyer_is_free(_db, h.case.defense_lawyer_id, new_start,
+                                         new_end, exclude_hearing_id=h.id):
+                        st.warning("⚠️ Lawyer has a conflict at the new time. "
+                                   "Time updated — conflict flagged.")
                     h.scheduled_start = new_start
-                    h.scheduled_end   = new_end
+                    h.scheduled_end = new_end
                     if h.status == "delayed":
                         h.status = "scheduled"
-
                     audit(_db, "HEARING_RESCHEDULED", h.id, {
                         "old_start": old_start.isoformat(),
                         "new_start": new_start.isoformat(),
@@ -373,8 +558,140 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                     )
                     st.rerun()
                 except Exception as e:
-                    _db.rollback()
-                    st.error(f"Reschedule failed: {e}")
+                    _db.rollback(); st.error(f"Reschedule failed: {e}")
+                finally:
+                    _db.close()
+
+    # ── EDIT CASE  [blocking gap #2] ──────────────────────────────────────────
+    with edit_tab:
+        st.markdown("**Change the defence lawyer or close a case**")
+
+        _db_ec = get_db()
+        edit_cases = _db_ec.execute(
+            select(Case).where(Case.status == "active").order_by(Case.case_number)
+        ).scalars().all()
+        _db_ec.close()
+
+        if not edit_cases:
+            st.info("No active cases.")
+        else:
+            ec_opts = {
+                c.id: (f"{c.case_number} · "
+                       f"{c.accused.name if c.accused else '?'} · "
+                       f"{c.case_type.title()}")
+                for c in edit_cases
+            }
+            ec_case_id = st.selectbox(
+                "Select case",
+                options=list(ec_opts.keys()),
+                format_func=lambda x: ec_opts[x],
+                key="ec_case_select",
+            )
+            ec_case = next(c for c in edit_cases if c.id == ec_case_id)
+
+            e1, e2, e3 = st.columns(3)
+            e1.metric("Case number", ec_case.case_number)
+            e2.metric("Current lawyer",
+                      ec_case.defense_lawyer.name if ec_case.defense_lawyer else "—")
+            e3.metric("Status", ec_case.status.title())
+
+            st.divider()
+            st.markdown("**Change defence lawyer**")
+
+            _db_eu = get_db()
+            upcoming_ec = _db_eu.execute(
+                select(Hearing)
+                .where(
+                    Hearing.case_id == ec_case_id,
+                    Hearing.status.in_(["scheduled", "delayed"]),
+                    Hearing.scheduled_start >= datetime.now(),
+                )
+                .order_by(Hearing.scheduled_start)
+            ).scalars().all()
+            _db_eu.close()
+
+            if upcoming_ec:
+                st.caption(
+                    f"This case has **{len(upcoming_ec)}** upcoming hearing(s). "
+                    "The new lawyer will be checked for conflicts at those times."
+                )
+
+            _db_ecl = get_db()
+            all_lawyers_ec = _db_ecl.execute(
+                select(Lawyer).order_by(Lawyer.name)
+            ).scalars().all()
+            _db_ecl.close()
+            ec_lawyer_opts = {l.id: f"{l.name}  ({l.bar_number})"
+                              for l in all_lawyers_ec}
+
+            with st.form("edit_lawyer_form"):
+                _ec_def = (
+                    list(ec_lawyer_opts.keys()).index(ec_case.defense_lawyer_id)
+                    if ec_case.defense_lawyer_id in ec_lawyer_opts else 0
+                )
+                ec_new_lawyer_id = st.selectbox(
+                    "New defence lawyer",
+                    options=list(ec_lawyer_opts.keys()),
+                    index=_ec_def,
+                    format_func=lambda x: ec_lawyer_opts[x],
+                )
+                ec_submitted = st.form_submit_button(
+                    "Update Lawyer", type="primary", use_container_width=True
+                )
+
+            if ec_submitted:
+                if ec_new_lawyer_id == ec_case.defense_lawyer_id:
+                    st.info("No change — same lawyer selected.")
+                else:
+                    _db = get_db()
+                    try:
+                        conflicts = [
+                            uh for uh in upcoming_ec
+                            if not lawyer_is_free(_db, ec_new_lawyer_id,
+                                                  uh.scheduled_start, uh.scheduled_end)
+                        ]
+                        case_obj = _db.get(Case, ec_case_id)
+                        old_lid = case_obj.defense_lawyer_id
+                        case_obj.defense_lawyer_id = ec_new_lawyer_id
+                        audit(_db, "LAWYER_CHANGED", ec_case_id, {
+                            "case_number": ec_case.case_number,
+                            "old_lawyer_id": old_lid,
+                            "new_lawyer_id": ec_new_lawyer_id,
+                        }, entity_type="case")
+                        _db.commit()
+                        new_name = ec_lawyer_opts[ec_new_lawyer_id].split("  ")[0]
+                        if conflicts:
+                            st.warning(
+                                f"✅ Lawyer updated to **{new_name}** but "
+                                f"**{len(conflicts)} conflict(s)** detected "
+                                "at upcoming hearing times."
+                            )
+                        else:
+                            st.success(f"✅ Defence lawyer updated to **{new_name}**.")
+                        st.rerun()
+                    except Exception as e:
+                        _db.rollback(); st.error(f"Update failed: {e}")
+                    finally:
+                        _db.close()
+
+            st.divider()
+            st.markdown("**Close case**")
+            st.caption(
+                "Mark as concluded. All hearing records and the audit trail are preserved."
+            )
+            close_confirm = st.checkbox("Confirm: close this case", key="ec_close_confirm")
+            if st.button("Close Case", disabled=not close_confirm,
+                         key="ec_close_btn", use_container_width=True):
+                _db = get_db()
+                try:
+                    _db.get(Case, ec_case_id).status = "closed"
+                    audit(_db, "CASE_CLOSED", ec_case_id,
+                          {"case_number": ec_case.case_number}, entity_type="case")
+                    _db.commit()
+                    st.success(f"✅ Case **{ec_case.case_number}** closed.")
+                    st.rerun()
+                except Exception as e:
+                    _db.rollback(); st.error(f"Failed to close case: {e}")
                 finally:
                     _db.close()
 
@@ -382,10 +699,10 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
     with remove_tab:
         st.markdown("**Cancel a hearing or remove a case from the docket**")
         st.caption(
-            "Cancelling a hearing keeps the record and audit trail intact. "
-            "Removing a case permanently deletes it and all its hearings."
+            "Cancelling keeps the record and audit trail intact. "
+            "Removing permanently deletes the case and all its hearings. "
+            "Shows all active hearings for this courtroom across all dates."
         )
-
         _db_rm = get_db()
         removable = _db_rm.execute(
             select(Hearing)
@@ -395,99 +712,76 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
             )
             .order_by(Hearing.scheduled_start)
         ).scalars().all()
-        rm_day = [h for h in removable if h.scheduled_start.date() == run_date]
         _db_rm.close()
 
-        if not rm_day:
-            st.info("No active hearings for the selected courtroom and date.")
+        if not removable:
+            st.info("No active hearings for this courtroom.")
         else:
             rm_opts = {
                 h.id: (
-                    f"{h.scheduled_start.strftime('%-I:%M %p')} · "
+                    f"{h.scheduled_start.strftime('%b %d, %-I:%M %p')} · "
                     f"{h.case.case_number} · "
                     f"{h.hearing_type.replace('_', ' ').title()}"
                 )
-                for h in rm_day
+                for h in removable
             }
-
             rm_hearing_id = st.selectbox(
                 "Select hearing",
                 options=list(rm_opts.keys()),
                 format_func=lambda x: rm_opts[x],
                 key="rm_select",
             )
-
             rm_action = st.radio(
                 "Action",
                 ["Cancel hearing only", "Remove case entirely"],
-                horizontal=True,
-                key="rm_action",
+                horizontal=True, key="rm_action",
             )
-
             st.warning(
                 "**Cancel hearing** sets status to Cancelled — record is kept. \n\n"
                 "**Remove case** permanently deletes the case, accused, and all "
                 "its hearings. This cannot be undone."
             )
-
             confirm = st.checkbox("I confirm this action", key="rm_confirm")
-
-            if st.button("Apply", type="primary",
-                         disabled=not confirm, key="rm_apply",
-                         use_container_width=True):
+            if st.button("Apply", type="primary", disabled=not confirm,
+                         key="rm_apply", use_container_width=True):
                 _db = get_db()
                 try:
                     h = _db.get(Hearing, rm_hearing_id)
                     case_num = h.case.case_number
-
                     if rm_action == "Cancel hearing only":
                         h.status = "cancelled"
                         audit(_db, "HEARING_CANCELLED", h.id, {
-                            "case_number": case_num,
-                            "reason": "Cancelled by clerk",
+                            "case_number": case_num, "reason": "Cancelled by clerk",
                         })
                         _db.commit()
                         st.success(f"✅ Hearing for **{case_num}** cancelled.")
-
                     else:
-                        # Remove all hearings for this case then the case itself
+                        from sqlalchemy import text
                         case_obj = h.case
                         hearing_ids = [hh.id for hh in case_obj.hearings]
-
-                        # Clear related records
-                        from sqlalchemy import text
                         if hearing_ids:
                             ph = ",".join(str(i) for i in hearing_ids)
                             _db.execute(text(
                                 f"DELETE FROM lawyer_conflicts "
-                                f"WHERE hearing_a_id IN ({ph}) "
-                                f"OR hearing_b_id IN ({ph})"
+                                f"WHERE hearing_a_id IN ({ph}) OR hearing_b_id IN ({ph})"
                             ))
                             _db.execute(text(
-                                f"DELETE FROM eta_estimates "
-                                f"WHERE hearing_id IN ({ph})"
+                                f"DELETE FROM eta_estimates WHERE hearing_id IN ({ph})"
                             ))
-
                         audit(_db, "CASE_REMOVED", h.id, {
-                            "case_number": case_num,
-                            "case_type": case_obj.case_type,
+                            "case_number": case_num, "case_type": case_obj.case_type,
                         })
                         _db.flush()
-
                         for hh in list(case_obj.hearings):
                             _db.delete(hh)
                         if case_obj.accused:
                             _db.delete(case_obj.accused)
                         _db.delete(case_obj)
                         _db.commit()
-                        st.success(
-                            f"✅ Case **{case_num}** and all its hearings removed."
-                        )
-
+                        st.success(f"✅ Case **{case_num}** and all its hearings removed.")
                     st.rerun()
                 except Exception as e:
-                    _db.rollback()
-                    st.error(f"Action failed: {e}")
+                    _db.rollback(); st.error(f"Action failed: {e}")
                 finally:
                     _db.close()
 
@@ -498,48 +792,33 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
             "All rows are assigned to the courtroom selected in the sidebar. "
             "Rows with validation errors are skipped — valid rows are committed together."
         )
-
-        # ── Template download ─────────────────────────────────────────────────
         _TEMPLATE_COLS = [
             "accused_name", "case_type", "hearing_type",
             "complexity", "hearing_date", "start_time", "lawyer_bar_number",
         ]
         _TEMPLATE_ROWS = [
-            ["Jane Smith",   "criminal", "arraignment",       "low",    "2026-04-30", "09:00", "BAR-001"],
-            ["John Doe",     "civil",    "status_conference", "medium", "2026-04-30", "10:00", "BAR-002"],
-            ["Alice Brown",  "traffic",  "plea_hearing",      "low",    "2026-04-30", "11:00", "BAR-003"],
+            ["Jane Smith",  "criminal", "arraignment",       "low",    "2026-04-30", "09:00", "BAR-001"],
+            ["John Doe",    "civil",    "status_conference", "medium", "2026-04-30", "10:00", "BAR-002"],
+            ["Alice Brown", "traffic",  "plea_hearing",      "low",    "2026-04-30", "11:00", "BAR-003"],
         ]
-        _template_buf = io.BytesIO()
-        pd.DataFrame(_TEMPLATE_ROWS, columns=_TEMPLATE_COLS).to_csv(
-            _template_buf, index=False
-        )
+        _tmpl_buf = io.BytesIO()
+        pd.DataFrame(_TEMPLATE_ROWS, columns=_TEMPLATE_COLS).to_csv(_tmpl_buf, index=False)
         st.download_button(
             "⬇️  Download template CSV",
-            data=_template_buf.getvalue(),
+            data=_tmpl_buf.getvalue(),
             file_name="case_upload_template.csv",
             mime="text/csv",
-            use_container_width=False,
         )
 
-        # ── Valid hearing types flat set for quick lookup ──────────────────────
-        _ALL_HEARING_TYPES = {
-            ht for hts in HEARING_TYPES.values() for ht in hts
-        }
-
-        # ── File uploader ──────────────────────────────────────────────────────
         uploaded = st.file_uploader(
-            "Choose a CSV or Excel file",
-            type=["csv", "xlsx"],
-            key="bulk_uploader",
+            "Choose a CSV or Excel file", type=["csv", "xlsx"], key="bulk_uploader",
         )
 
         if uploaded is not None:
-            # Parse
             try:
-                if uploaded.name.endswith(".xlsx"):
-                    raw_df = pd.read_excel(uploaded, dtype=str)
-                else:
-                    raw_df = pd.read_csv(uploaded, dtype=str)
+                raw_df = (pd.read_excel(uploaded, dtype=str)
+                          if uploaded.name.endswith(".xlsx")
+                          else pd.read_csv(uploaded, dtype=str))
             except Exception as e:
                 st.error(f"Could not parse file: {e}")
                 raw_df = None
@@ -549,15 +828,12 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                 missing_cols = [c for c in _TEMPLATE_COLS if c not in raw_df.columns]
                 if missing_cols:
                     st.error(
-                        f"File is missing required column(s): "
-                        f"**{', '.join(missing_cols)}**. "
-                        "Download the template above to see the expected format."
+                        f"Missing column(s): **{', '.join(missing_cols)}**. "
+                        "Download the template above."
                     )
                 else:
-                    raw_df = raw_df[_TEMPLATE_COLS].copy()
-                    raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+                    raw_df = raw_df[_TEMPLATE_COLS].dropna(how="all").reset_index(drop=True)
 
-                    # Load lawyers once for lookup
                     _db_bl = get_db()
                     all_lawyers_bulk = _db_bl.execute(
                         select(Lawyer).order_by(Lawyer.name)
@@ -565,99 +841,85 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                     _db_bl.close()
                     lawyers_by_bar = {l.bar_number: l for l in all_lawyers_bulk}
 
-                    # ── Per-row validation ─────────────────────────────────────
                     preview_rows = []
                     _db_val = get_db()
                     try:
                         for idx, row in raw_df.iterrows():
-                            errors, warnings = [], []
-
-                            def _get(col):
+                            def _g(col):
                                 v = row.get(col, "")
                                 return "" if pd.isna(v) else str(v).strip()
 
-                            accused_name  = _get("accused_name")
-                            case_type     = _get("case_type").lower()
-                            hearing_type  = _get("hearing_type").lower()
-                            complexity    = _get("complexity").lower()
-                            date_str      = _get("hearing_date")
-                            time_str      = _get("start_time")
-                            bar_num       = _get("lawyer_bar_number")
+                            accused_name = _g("accused_name")
+                            case_type    = _g("case_type").lower()
+                            hearing_type = _g("hearing_type").lower()
+                            complexity   = _g("complexity").lower()
+                            date_str     = _g("hearing_date")
+                            time_str     = _g("start_time")
+                            bar_num      = _g("lawyer_bar_number")
 
+                            errors, warnings = [], []
                             if not accused_name:
-                                errors.append("accused_name is required")
+                                errors.append("accused_name required")
                             if case_type not in HEARING_TYPES:
-                                errors.append(f"case_type must be criminal/civil/traffic (got '{case_type}')")
+                                errors.append(f"invalid case_type '{case_type}'")
                             elif hearing_type not in HEARING_TYPES[case_type]:
-                                valid = ", ".join(HEARING_TYPES[case_type])
-                                errors.append(f"hearing_type '{hearing_type}' invalid for {case_type} (valid: {valid})")
+                                errors.append(
+                                    f"'{hearing_type}' invalid for {case_type}; "
+                                    f"valid: {', '.join(HEARING_TYPES[case_type])}"
+                                )
                             if complexity not in ("low", "medium", "high"):
-                                errors.append(f"complexity must be low/medium/high (got '{complexity}')")
-
+                                errors.append(f"invalid complexity '{complexity}'")
                             h_date, h_time = None, None
                             try:
                                 h_date = pd.to_datetime(date_str).date()
                             except Exception:
-                                errors.append(f"hearing_date invalid (use YYYY-MM-DD, got '{date_str}')")
+                                errors.append(f"bad hearing_date '{date_str}'")
                             try:
                                 h_time = datetime.strptime(time_str, "%H:%M").time()
                             except Exception:
-                                errors.append(f"start_time invalid (use HH:MM 24-hour, got '{time_str}')")
-
+                                errors.append(f"bad start_time '{time_str}' (use HH:MM)")
                             lawyer = lawyers_by_bar.get(bar_num)
                             if not lawyer:
-                                errors.append(f"No lawyer found with bar # '{bar_num}'")
+                                errors.append(f"no lawyer with bar # '{bar_num}'")
 
                             if not errors and h_date and h_time and lawyer:
-                                start_dt = datetime.combine(h_date, h_time)
+                                s_dt = datetime.combine(h_date, h_time)
                                 dur = estimate_duration(case_type, hearing_type, complexity)
-                                end_dt = start_dt + timedelta(minutes=dur)
-                                if not lawyer_is_free(_db_val, lawyer.id, start_dt, end_dt):
+                                if not lawyer_is_free(_db_val, lawyer.id, s_dt,
+                                                      s_dt + timedelta(minutes=dur)):
                                     warnings.append(
-                                        f"{lawyer.name} has a scheduling conflict "
-                                        f"at {start_dt.strftime('%-I:%M %p')}"
+                                        f"{lawyer.name} has a conflict at "
+                                        f"{s_dt.strftime('%-I:%M %p')}"
                                     )
 
-                            if errors:
-                                status = "❌ Error"
-                                notes  = "; ".join(errors)
-                            elif warnings:
-                                status = "⚠️ Conflict"
-                                notes  = "; ".join(warnings)
-                            else:
-                                status = "✅ Ready"
-                                notes  = ""
-
+                            status = ("❌ Error" if errors
+                                      else "⚠️ Conflict" if warnings
+                                      else "✅ Ready")
                             preview_rows.append({
-                                "Row":          idx + 1,
-                                "Status":       status,
-                                "Accused":      accused_name,
-                                "Case type":    case_type.title(),
+                                "Row": idx + 1, "Status": status,
+                                "Accused": accused_name,
+                                "Case type": case_type.title(),
                                 "Hearing type": hearing_type.replace("_", " ").title(),
-                                "Date":         date_str,
-                                "Time":         time_str,
+                                "Date": date_str, "Time": time_str,
                                 "Lawyer bar #": bar_num,
-                                "Notes":        notes,
+                                "Notes": "; ".join(errors + warnings),
                             })
                     finally:
                         _db_val.close()
 
-                    # ── Preview table ──────────────────────────────────────────
-                    preview_df = pd.DataFrame(preview_rows)
                     n_ready    = sum(1 for r in preview_rows if r["Status"] == "✅ Ready")
                     n_conflict = sum(1 for r in preview_rows if r["Status"] == "⚠️ Conflict")
                     n_error    = sum(1 for r in preview_rows if r["Status"] == "❌ Error")
                     n_commit   = n_ready + n_conflict
 
                     pc1, pc2, pc3 = st.columns(3)
-                    pc1.metric("Ready to commit", n_ready, delta=None)
-                    pc2.metric("Has conflict (will still commit)", n_conflict)
-                    pc3.metric("Errors (will skip)", n_error)
+                    pc1.metric("Ready", n_ready)
+                    pc2.metric("Has conflict (will commit)", n_conflict)
+                    pc3.metric("Errors (skipped)", n_error)
 
                     st.dataframe(
-                        preview_df,
-                        use_container_width=True,
-                        hide_index=True,
+                        pd.DataFrame(preview_rows),
+                        use_container_width=True, hide_index=True,
                         column_config={
                             "Status": st.column_config.TextColumn(width="small"),
                             "Notes":  st.column_config.TextColumn(width="large"),
@@ -665,12 +927,12 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                     )
 
                     if n_commit == 0:
-                        st.error("No valid rows to commit. Fix the errors above and re-upload.")
+                        st.error("No valid rows to commit. Fix the errors and re-upload.")
                     else:
                         st.info(
                             f"**{n_commit} row(s)** will be added to "
                             f"**{room_map[selected_id]}**. "
-                            f"{n_error} error row(s) will be skipped."
+                            f"{n_error} error row(s) skipped."
                         )
                         bulk_confirm = st.checkbox(
                             f"Confirm: add {n_commit} case(s) to the docket",
@@ -686,14 +948,12 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                             _db_ins = get_db()
                             inserted, skipped = 0, 0
                             try:
-                                courtroom_obj = _db_ins.get(Courtroom, selected_id)
+                                cr_obj = _db_ins.get(Courtroom, selected_id)
                                 for row_dict, raw_row in zip(
                                     preview_rows, raw_df.itertuples(index=False)
                                 ):
                                     if row_dict["Status"] == "❌ Error":
-                                        skipped += 1
-                                        continue
-
+                                        skipped += 1; continue
                                     ct  = str(getattr(raw_row, "case_type")).strip().lower()
                                     ht  = str(getattr(raw_row, "hearing_type")).strip().lower()
                                     cmp = str(getattr(raw_row, "complexity")).strip().lower()
@@ -706,50 +966,30 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                                     ).time()
                                     bar = str(getattr(raw_row, "lawyer_bar_number")).strip()
                                     lyr = lawyers_by_bar[bar]
-
-                                    start_dt = datetime.combine(h_d, h_t)
-                                    dur      = estimate_duration(ct, ht, cmp)
-                                    end_dt   = start_dt + timedelta(minutes=dur)
+                                    s_dt = datetime.combine(h_d, h_t)
+                                    dur  = estimate_duration(ct, ht, cmp)
                                     case_num = next_case_number(_db_ins, ct, selected_id)
-
-                                    new_case = Case(
-                                        case_number=case_num,
-                                        case_type=ct,
-                                        complexity=cmp,
-                                        status="active",
+                                    nc = Case(
+                                        case_number=case_num, case_type=ct,
+                                        complexity=cmp, status="active",
                                         defense_lawyer_id=lyr.id,
                                     )
-                                    _db_ins.add(new_case)
-                                    _db_ins.flush()
-
-                                    _db_ins.add(Accused(
-                                        name=acc,
-                                        case_id=new_case.id,
-                                    ))
-
-                                    new_hearing = Hearing(
-                                        case_id=new_case.id,
-                                        courtroom_id=selected_id,
-                                        judge_id=courtroom_obj.judge.id,
-                                        hearing_type=ht,
-                                        scheduled_start=start_dt,
-                                        scheduled_end=end_dt,
-                                        estimated_duration_mins=dur,
-                                        status="scheduled",
+                                    _db_ins.add(nc); _db_ins.flush()
+                                    _db_ins.add(Accused(name=acc, case_id=nc.id))
+                                    nh = Hearing(
+                                        case_id=nc.id, courtroom_id=selected_id,
+                                        judge_id=cr_obj.judge.id, hearing_type=ht,
+                                        scheduled_start=s_dt,
+                                        scheduled_end=s_dt + timedelta(minutes=dur),
+                                        estimated_duration_mins=dur, status="scheduled",
                                     )
-                                    _db_ins.add(new_hearing)
-                                    _db_ins.flush()
-
-                                    audit(_db_ins, "HEARING_ADDED", new_hearing.id, {
-                                        "case_number":  case_num,
-                                        "case_type":    ct,
-                                        "hearing_type": ht,
-                                        "start":        start_dt.isoformat(),
-                                        "lawyer_id":    lyr.id,
-                                        "source":       "bulk_upload",
+                                    _db_ins.add(nh); _db_ins.flush()
+                                    audit(_db_ins, "HEARING_ADDED", nh.id, {
+                                        "case_number": case_num, "case_type": ct,
+                                        "hearing_type": ht, "start": s_dt.isoformat(),
+                                        "lawyer_id": lyr.id, "source": "bulk_upload",
                                     })
                                     inserted += 1
-
                                 _db_ins.commit()
                                 st.success(
                                     f"✅ **{inserted} case(s) added** to "
@@ -758,8 +998,7 @@ with st.expander("📁 Case Management — Add · Reschedule · Remove · Bulk U
                                 )
                                 st.rerun()
                             except Exception as e:
-                                _db_ins.rollback()
-                                st.error(f"Bulk insert failed: {e}")
+                                _db_ins.rollback(); st.error(f"Bulk insert failed: {e}")
                             finally:
                                 _db_ins.close()
 
@@ -789,11 +1028,11 @@ try:
     canc  = sum(1 for h in day_hearings if h.status == "cancelled")
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total",       total)
-    m2.metric("Remaining",   sched)
+    m1.metric("Total", total)
+    m2.metric("Remaining", sched)
     m3.metric("In Progress", live)
-    m4.metric("Completed",   done)
-    m5.metric("Cancelled",   canc)
+    m4.metric("Completed", done)
+    m5.metric("Cancelled", canc)
     st.divider()
 
     for h in day_hearings:
@@ -856,10 +1095,8 @@ try:
                 else:
                     st.success("Accused ✓ checked in")
 
-            # Status override
             st.divider()
-            status_opts = ["scheduled", "in_progress", "completed",
-                           "delayed", "cancelled"]
+            status_opts = ["scheduled", "in_progress", "completed", "delayed", "cancelled"]
             sc1, sc2 = st.columns([3, 1])
             with sc1:
                 new_status = st.selectbox(
@@ -879,7 +1116,6 @@ try:
                         h2.actual_end = datetime.now()
                     _db.commit(); _db.close(); st.rerun()
 
-            # Conflict details
             db2 = get_db()
             hearing_conflicts = db2.execute(
                 select(LawyerConflict).where(
@@ -892,10 +1128,8 @@ try:
 
             if hearing_conflicts:
                 for c in hearing_conflicts:
-                    other_id = (
-                        c.hearing_b_id if c.hearing_a_id == h.id
-                        else c.hearing_a_id
-                    )
+                    other_id = (c.hearing_b_id if c.hearing_a_id == h.id
+                                else c.hearing_a_id)
                     db3 = get_db()
                     other      = db3.get(Hearing, other_id)
                     other_room = db3.get(Courtroom, other.courtroom_id) if other else None
@@ -913,7 +1147,6 @@ try:
                         _db.get(LawyerConflict, c.id).resolved = True
                         _db.commit(); _db.close(); st.rerun()
 
-            # Audit trail
             with st.expander("📋 Audit trail"):
                 db4 = get_db()
                 audit_rows = db4.execute(
