@@ -10,7 +10,7 @@ from sqlalchemy import select, func, or_
 
 from db.database import init_db, SessionLocal
 from db.models import (
-    Courtroom, Hearing, Case, Accused, Lawyer,
+    Courtroom, Hearing, Case, Accused, Lawyer, Judge,
     LawyerConflict, AuditLog,
 )
 from config import HEARING_DURATIONS, COMPLEXITY_MULTIPLIER
@@ -265,6 +265,11 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                 options=list(lawyer_opts.keys()),
                 format_func=lambda x: lawyer_opts[x],
             )
+            ac_notes = st.text_area(
+                "Clerk notes (optional)",
+                placeholder="e.g. Interpreter required · Defendant in custody · Remote hearing",
+                height=70,
+            )
             ac_submitted = st.form_submit_button(
                 "Add to Docket", type="primary", use_container_width=True
             )
@@ -312,6 +317,7 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                         judge_id=courtroom.judge.id, hearing_type=ac_hearing_type,
                         scheduled_start=start_dt, scheduled_end=end_dt,
                         estimated_duration_mins=dur, status="scheduled",
+                        notes=ac_notes.strip() or None,
                     )
                     _db.add(new_hearing); _db.flush()
                     audit(_db, "HEARING_ADDED", new_hearing.id, {
@@ -435,6 +441,11 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                     index=_def_idx,
                     format_func=lambda x: fu_lawyer_opts[x],
                 )
+                fu_notes = st.text_area(
+                    "Clerk notes (optional)",
+                    placeholder="e.g. Interpreter required · Defendant in custody · Remote hearing",
+                    height=70,
+                )
                 fu_submitted = st.form_submit_button(
                     "Schedule Hearing", type="primary", use_container_width=True
                 )
@@ -457,6 +468,7 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                         judge_id=cr_obj.judge.id, hearing_type=fu_hearing_type,
                         scheduled_start=fu_start, scheduled_end=end_dt,
                         estimated_duration_mins=dur, status="scheduled",
+                        notes=fu_notes.strip() or None,
                     )
                     _db.add(new_h); _db.flush()
 
@@ -1027,13 +1039,47 @@ try:
     sched = sum(1 for h in day_hearings if h.status == "scheduled")
     canc  = sum(1 for h in day_hearings if h.status == "cancelled")
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total", total)
-    m2.metric("Remaining", sched)
-    m3.metric("In Progress", live)
-    m4.metric("Completed", done)
-    m5.metric("Cancelled", canc)
+    # ── Item 5: Docket export ──────────────────────────────────────────────────
+    _exp_rows = []
+    for _h in day_hearings:
+        _exp_rows.append({
+            "Time":           _h.scheduled_start.strftime("%-I:%M %p"),
+            "Case number":    _h.case.case_number,
+            "Case type":      _h.case.case_type.title(),
+            "Hearing type":   _h.hearing_type.replace("_", " ").title(),
+            "Complexity":     _h.case.complexity.title(),
+            "Est. mins":      _h.estimated_duration_mins,
+            "Accused":        _h.case.accused.name if _h.case.accused else "",
+            "Lawyer":         _h.case.defense_lawyer.name if _h.case.defense_lawyer else "",
+            "Bar #":          _h.case.defense_lawyer.bar_number if _h.case.defense_lawyer else "",
+            "Status":         _h.status.replace("_", " ").title(),
+            "Notes":          _h.notes or "",
+        })
+    _exp_buf = io.BytesIO()
+    pd.DataFrame(_exp_rows).to_csv(_exp_buf, index=False)
+    _exp_fname = (
+        f"docket_{room_map[selected_id].replace(' ', '_')}_"
+        f"{run_date.strftime('%Y-%m-%d')}.csv"
+    )
+
+    mx1, mx2, mx3, mx4, mx5, mx6 = st.columns([1, 1, 1, 1, 1, 1])
+    mx1.metric("Total", total)
+    mx2.metric("Remaining", sched)
+    mx3.metric("In Progress", live)
+    mx4.metric("Completed", done)
+    mx5.metric("Cancelled", canc)
+    mx6.download_button(
+        "📥 Export CSV",
+        data=_exp_buf.getvalue(),
+        file_name=_exp_fname,
+        mime="text/csv",
+        use_container_width=True,
+    )
     st.divider()
+
+    # Load all judges once for substitute-judge selectors
+    _all_judges = db.execute(select(Judge).order_by(Judge.name)).scalars().all()
+    _judge_opts = {j.id: f"{j.name} (Courtroom {j.courtroom_id})" for j in _all_judges}
 
     for h in day_hearings:
         case: Case     = h.case
@@ -1095,15 +1141,35 @@ try:
                 else:
                     st.success("Accused ✓ checked in")
 
+            # ── Item 8: Notes ──────────────────────────────────────────────────
+            if h.notes:
+                st.info(f"📝 **Note:** {h.notes}")
+            with st.expander("📝 Edit notes", expanded=False):
+                with st.form(f"notes_form_{h.id}"):
+                    new_notes = st.text_area(
+                        "Notes",
+                        value=h.notes or "",
+                        height=80,
+                        label_visibility="collapsed",
+                        placeholder="Interpreter required · Defendant in custody · Remote hearing",
+                    )
+                    if st.form_submit_button("Save notes", use_container_width=True):
+                        _db = get_db()
+                        _db.get(Hearing, h.id).notes = new_notes.strip() or None
+                        audit(_db, "NOTES_UPDATED", h.id,
+                              {"notes": new_notes.strip() or None})
+                        _db.commit(); _db.close(); st.rerun()
+
             st.divider()
-            status_opts = ["scheduled", "in_progress", "completed", "delayed", "cancelled"]
-            sc1, sc2 = st.columns([3, 1])
+
+            # Status override + Item 6: substitute judge on same row
+            sc1, sc2, sc3, sc4 = st.columns([3, 1, 3, 1])
             with sc1:
                 new_status = st.selectbox(
-                    "Update status", status_opts,
-                    index=status_opts.index(h.status),
-                    key=f"s_{h.id}",
-                    label_visibility="collapsed",
+                    "Status", ["scheduled", "in_progress", "completed", "delayed", "cancelled"],
+                    index=["scheduled", "in_progress", "completed",
+                           "delayed", "cancelled"].index(h.status),
+                    key=f"s_{h.id}", label_visibility="collapsed",
                 )
             with sc2:
                 if st.button("Apply", key=f"ap_{h.id}", use_container_width=True):
@@ -1115,6 +1181,32 @@ try:
                     if new_status == "completed" and not h2.actual_end:
                         h2.actual_end = datetime.now()
                     _db.commit(); _db.close(); st.rerun()
+
+            # ── Item 6: Substitute judge ───────────────────────────────────────
+            with sc3:
+                sub_judge_id = st.selectbox(
+                    "Judge",
+                    options=list(_judge_opts.keys()),
+                    index=list(_judge_opts.keys()).index(h.judge_id)
+                          if h.judge_id in _judge_opts else 0,
+                    format_func=lambda x: _judge_opts[x],
+                    key=f"j_{h.id}", label_visibility="collapsed",
+                )
+            with sc4:
+                if st.button("Sub", key=f"jsub_{h.id}", use_container_width=True,
+                             help="Assign substitute judge"):
+                    if sub_judge_id != h.judge_id:
+                        _db = get_db()
+                        h2 = _db.get(Hearing, h.id)
+                        old_jid = h2.judge_id
+                        h2.judge_id = sub_judge_id
+                        audit(_db, "JUDGE_SUBSTITUTED", h.id, {
+                            "old_judge_id": old_jid,
+                            "new_judge_id": sub_judge_id,
+                        })
+                        _db.commit(); _db.close(); st.rerun()
+                    else:
+                        st.toast("Same judge selected — no change.")
 
             db2 = get_db()
             hearing_conflicts = db2.execute(
@@ -1167,3 +1259,75 @@ try:
 
 finally:
     db.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALL COURTROOMS — DAILY OVERVIEW  [significant gap #9]
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.divider()
+with st.expander(
+    f"🏛️ All Courtrooms — {run_date.strftime('%A, %B %d %Y')}",
+    expanded=False,
+):
+    _db_ov = get_db()
+    try:
+        _ov_all = _db_ov.execute(
+            select(Hearing)
+            .where(Hearing.scheduled_start >= datetime.combine(run_date, time(0, 0)),
+                   Hearing.scheduled_start <  datetime.combine(run_date + timedelta(days=1), time(0, 0)))
+            .order_by(Hearing.scheduled_start)
+        ).scalars().all()
+
+        _cr_list = _db_ov.execute(
+            select(Courtroom).order_by(Courtroom.id)
+        ).scalars().all()
+
+        ov_rows = []
+        for _cr in _cr_list:
+            _cr_hs = [_h for _h in _ov_all if _h.courtroom_id == _cr.id]
+            _live  = next((_h for _h in _cr_hs if _h.status == "in_progress"), None)
+            ov_rows.append({
+                "Courtroom":   _cr.name,
+                "Judge":       _cr.judge.name if _cr.judge else "—",
+                "Total":       len(_cr_hs),
+                "Scheduled":   sum(1 for _h in _cr_hs if _h.status == "scheduled"),
+                "In Progress": sum(1 for _h in _cr_hs if _h.status == "in_progress"),
+                "Completed":   sum(1 for _h in _cr_hs if _h.status == "completed"),
+                "Delayed":     sum(1 for _h in _cr_hs if _h.status == "delayed"),
+                "Cancelled":   sum(1 for _h in _cr_hs if _h.status == "cancelled"),
+                "Current case": (
+                    f"{_live.case.case_number} · "
+                    f"{_live.hearing_type.replace('_', ' ').title()}"
+                    if _live else "—"
+                ),
+            })
+
+        ov_df = pd.DataFrame(ov_rows)
+        st.dataframe(
+            ov_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Courtroom":    st.column_config.TextColumn(width="medium"),
+                "Judge":        st.column_config.TextColumn(width="medium"),
+                "Total":        st.column_config.NumberColumn(width="small"),
+                "Scheduled":    st.column_config.NumberColumn(width="small"),
+                "In Progress":  st.column_config.NumberColumn(width="small"),
+                "Completed":    st.column_config.NumberColumn(width="small"),
+                "Delayed":      st.column_config.NumberColumn(width="small"),
+                "Cancelled":    st.column_config.NumberColumn(width="small"),
+                "Current case": st.column_config.TextColumn(width="large"),
+            },
+        )
+
+        _total_day = len(_ov_all)
+        _done_day  = sum(1 for _h in _ov_all if _h.status == "completed")
+        _live_day  = sum(1 for _h in _ov_all if _h.status == "in_progress")
+        st.caption(
+            f"Courthouse total: **{_total_day}** hearings · "
+            f"**{_live_day}** in progress · "
+            f"**{_done_day}** completed"
+        )
+    finally:
+        _db_ov.close()

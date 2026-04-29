@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, event, select, func
+from sqlalchemy import create_engine, event, select, func, text
 from sqlalchemy.orm import sessionmaker, Session
 from config import DATABASE_URL
 from db.models import Base
@@ -21,14 +21,29 @@ def set_sqlite_pragma(dbapi_conn, _):
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
+def _apply_migrations() -> None:
+    """Safe ALTER TABLE migrations for columns added after initial release."""
+    stmts = [
+        "ALTER TABLE hearings ADD COLUMN notes TEXT",
+    ]
+    with engine.connect() as conn:
+        for stmt in stmts:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception:
+                pass  # column already exists — ignore
+
+
 def init_db() -> None:
-    """Create tables and auto-seed if the database is empty.
+    """Create tables, apply migrations, and auto-seed if the database is empty.
 
     Streamlit Community Cloud has an ephemeral filesystem — the SQLite
     file is lost on every restart. This ensures the app always has data
     without requiring a manual seed step.
     """
     Base.metadata.create_all(bind=engine)
+    _apply_migrations()
     _auto_seed_if_empty()
 
 

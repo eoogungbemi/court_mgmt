@@ -91,6 +91,7 @@ class Hearing(Base):
 
     lawyer_checked_in = Column(Boolean, default=False)
     accused_checked_in = Column(Boolean, default=False)
+    notes = Column(Text, nullable=True)
 
     case = relationship("Case", back_populates="hearings")
     courtroom = relationship("Courtroom", back_populates="hearings")
