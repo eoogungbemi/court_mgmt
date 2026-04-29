@@ -47,7 +47,10 @@ try:
     hearings = db.execute(
         select(Hearing)
         .join(Case, Case.id == Hearing.case_id)
-        .where(Case.defense_lawyer_id == selected_id)
+        .where(
+            Case.defense_lawyer_id == selected_id,
+            Case.is_confidential == False,    # sealed cases not shown here
+        )
         .order_by(Hearing.scheduled_start)
     ).scalars().all()
 

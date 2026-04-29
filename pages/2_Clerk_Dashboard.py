@@ -13,7 +13,7 @@ from db.models import (
     Courtroom, Hearing, Case, Accused, Lawyer, Judge,
     LawyerConflict, AuditLog,
 )
-from config import HEARING_DURATIONS, COMPLEXITY_MULTIPLIER
+from config import HEARING_DURATIONS, COMPLEXITY_MULTIPLIER, CLERK_PASSWORD
 
 st.set_page_config(
     page_title="Clerk Dashboard · Court",
@@ -22,6 +22,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 init_db()
+
+# ── Authentication gate ────────────────────────────────────────────────────────
+if not st.session_state.get("clerk_auth"):
+    st.markdown("## 🔐 Clerk Login")
+    st.caption("This area is restricted to authorised court clerks.")
+    with st.form("clerk_login"):
+        _pw = st.text_input("Password", type="password")
+        if st.form_submit_button("Sign in", type="primary", use_container_width=True):
+            if _pw == CLERK_PASSWORD:
+                st.session_state["clerk_auth"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    st.stop()
 
 PRO_SE_BAR = "PRO-SE"
 
@@ -99,6 +113,30 @@ def audit(db, event_type: str, entity_id: int, payload: dict,
     ))
 
 
+def mask_phone(phone: str | None) -> str:
+    """Mask a phone number for display in brief / semi-public contexts."""
+    if not phone:
+        return ""
+    digits = "".join(c for c in phone if c.isdigit())
+    return f"***-***-{digits[-4:]}" if len(digits) >= 4 else "***-****"
+
+
+def _record_export(courtroom_id: int, export_date: str, filename: str) -> None:
+    """Write a DOCKET_EXPORTED audit entry — called via download_button on_click."""
+    _db = SessionLocal()
+    try:
+        _db.add(AuditLog(
+            event_type="DOCKET_EXPORTED",
+            agent_name="ClerkDashboard",
+            entity_type="courtroom",
+            entity_id=courtroom_id,
+            payload=json.dumps({"date": export_date, "file": filename}),
+        ))
+        _db.commit()
+    finally:
+        _db.close()
+
+
 def _avail_table(all_lawyers, check_start: datetime, check_end: datetime) -> pd.DataFrame:
     """Return a DataFrame showing free/busy status for every lawyer."""
     _db = get_db()
@@ -131,6 +169,9 @@ selected_id = st.sidebar.selectbox(
 run_date = st.sidebar.date_input("Date", value=date.today())
 
 if st.sidebar.button("🔄 Refresh", use_container_width=True):
+    st.rerun()
+if st.sidebar.button("🔓 Sign out", use_container_width=True):
+    del st.session_state["clerk_auth"]
     st.rerun()
 
 st.sidebar.divider()
@@ -186,8 +227,11 @@ with st.expander("🔍 Case Search — find by case number, accused, or lawyer",
                     ).scalars().first()
                     with st.container(border=True):
                         r1, r2, r3, r4 = st.columns([2, 2, 2, 1])
-                        r1.markdown(f"**{mc.case_number}**")
-                        r2.write(mc.accused.name if mc.accused else "—")
+                        _conf_badge = " 🔒" if mc.is_confidential else ""
+                        r1.markdown(f"**{mc.case_number}**{_conf_badge}")
+                        _acc_disp = mc.accused.name if mc.accused else "—"
+                        _ph_disp  = f" · {mask_phone(mc.accused.phone)}" if mc.accused and mc.accused.phone else ""
+                        r2.write(f"{_acc_disp}{_ph_disp}")
                         r3.write(mc.defense_lawyer.name if mc.defense_lawyer else "—")
                         r4.write(f"{'🟢' if mc.status == 'active' else '⬛'} {mc.status.title()}")
                         if nh:
@@ -247,11 +291,18 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
         st.markdown("**Add a new case and first hearing to the docket**")
         st.caption("The case number is generated automatically.")
 
-        # Pro se checkbox outside form so lawyer section can react to it
-        ac_pro_se = st.checkbox(
-            "Pro se — defendant is self-represented (no defence counsel required)",
-            key="ac_pro_se",
-        )
+        # Flags outside form so lawyer section can react to pro_se reactively
+        _flag_col1, _flag_col2 = st.columns(2)
+        with _flag_col1:
+            ac_pro_se = st.checkbox(
+                "Pro se — defendant is self-represented (no defence counsel required)",
+                key="ac_pro_se",
+            )
+        with _flag_col2:
+            ac_confidential = st.checkbox(
+                "🔒 Sealed / confidential case — hide from public displays",
+                key="ac_confidential",
+            )
 
         _db_acl = get_db()
         _all_lawyers = _db_acl.execute(
@@ -339,6 +390,7 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                         case_number=case_num, case_type=ac_case_type,
                         complexity=ac_complexity, status="active",
                         defense_lawyer_id=_lawyer_id,
+                        is_confidential=ac_confidential,
                     )
                     _db.add(new_case); _db.flush()
                     _db.add(Accused(
@@ -741,6 +793,35 @@ with st.expander("📁 Case Management — Add · Follow-up · Reschedule · Edi
                         _db.rollback(); st.error(f"Update failed: {e}")
                     finally:
                         _db.close()
+
+            st.divider()
+            st.markdown("**Confidentiality**")
+            _is_conf_now = ec_case.is_confidential
+            _conf_label = (
+                "🔒 This case is currently **sealed / confidential**."
+                if _is_conf_now
+                else "This case is currently **public**."
+            )
+            st.caption(_conf_label)
+            if st.button(
+                "🔒 Seal case" if not _is_conf_now else "🔓 Unseal case",
+                key="ec_conf_toggle",
+                use_container_width=True,
+            ):
+                _db = get_db()
+                try:
+                    _c = _db.get(Case, ec_case_id)
+                    _c.is_confidential = not _is_conf_now
+                    audit(_db, "CASE_CONFIDENTIALITY_CHANGED", ec_case_id, {
+                        "case_number": ec_case.case_number,
+                        "is_confidential": not _is_conf_now,
+                    }, entity_type="case")
+                    _db.commit()
+                    st.rerun()
+                except Exception as e:
+                    _db.rollback(); st.error(f"Update failed: {e}")
+                finally:
+                    _db.close()
 
             st.divider()
             st.markdown("**Manage defendants**")
@@ -1190,6 +1271,8 @@ try:
         file_name=_exp_fname,
         mime="text/csv",
         use_container_width=True,
+        on_click=_record_export,
+        args=(selected_id, str(run_date), _exp_fname),
     )
     st.divider()
 
@@ -1210,14 +1293,21 @@ try:
             "cancelled":   "❌",
         }.get(h.status, "⚪")
 
+        _conf_prefix = "🔒 " if case.is_confidential else ""
         header = (
             f"{badge} {h.scheduled_start.strftime('%-I:%M %p')} · "
-            f"{case.case_number} · "
+            f"{_conf_prefix}{case.case_number} · "
             f"{h.hearing_type.replace('_', ' ').title()} · "
             f"{case.case_type.title()}"
         )
 
         with st.expander(header, expanded=(h.status == "in_progress")):
+            if case.is_confidential:
+                st.warning(
+                    "🔒 **Sealed / confidential case.** "
+                    "This matter must not be discussed in open court or "
+                    "disclosed to unauthorised parties."
+                )
             left, mid, right = st.columns(3)
 
             with left:
@@ -1424,8 +1514,9 @@ with st.expander(
                 "Delayed":     sum(1 for _h in _cr_hs if _h.status == "delayed"),
                 "Cancelled":   sum(1 for _h in _cr_hs if _h.status == "cancelled"),
                 "Current case": (
-                    f"{_live.case.case_number} · "
-                    f"{_live.hearing_type.replace('_', ' ').title()}"
+                    ("🔒 Sealed" if _live.case.is_confidential
+                     else f"{_live.case.case_number} · "
+                          f"{_live.hearing_type.replace('_', ' ').title()}")
                     if _live else "—"
                 ),
             })

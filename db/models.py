@@ -52,6 +52,7 @@ class Case(Base):
     case_type = Column(String, nullable=False)       # criminal | civil | traffic
     complexity = Column(String, nullable=False)      # low | medium | high
     status = Column(String, default="active")        # active | closed
+    is_confidential = Column(Boolean, default=False) # sealed / confidential cases
     defense_lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=False)
 
     defense_lawyer = relationship("Lawyer", back_populates="cases")

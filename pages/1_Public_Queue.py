@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from db.database import init_db, SessionLocal
 from db.models import Courtroom, Hearing, Case, ETAEstimate
+from sqlalchemy import false as sql_false
 
 st.set_page_config(
     page_title="Public Queue · Court",
@@ -26,7 +27,8 @@ st.page_link("Home.py", label="← Back to Home", icon="⚖️")
 st.divider()
 
 st.info(
-    "ℹ️  Case numbers only are shown on this screen. "
+    "ℹ️  Case numbers and hearing types only are shown on this screen. "
+    "Sealed and confidential matters are not listed. "
     "For full details, speak to the court clerk.",
     icon=None,
 )
@@ -64,9 +66,11 @@ try:
     for idx, room in enumerate(courtrooms):
         hearings_today = db.execute(
             select(Hearing)
+            .join(Case, Case.id == Hearing.case_id)
             .where(
                 Hearing.courtroom_id == room.id,
                 Hearing.status != "cancelled",
+                Case.is_confidential == False,   # sealed cases never appear publicly
             )
             .order_by(Hearing.scheduled_start)
         ).scalars().all()

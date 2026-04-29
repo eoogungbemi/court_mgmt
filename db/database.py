@@ -31,6 +31,15 @@ def _apply_migrations() -> None:
         except Exception:
             pass
 
+        # 2. cases.is_confidential column
+        try:
+            conn.execute(text(
+                "ALTER TABLE cases ADD COLUMN is_confidential BOOLEAN DEFAULT 0"
+            ))
+            conn.commit()
+        except Exception:
+            pass
+
         # 2. Remove UNIQUE constraint from accused.case_id to allow co-defendants.
         #    Detected by checking for a non-PK unique index on the table.
         indices = conn.execute(text("PRAGMA index_list(accused)")).fetchall()

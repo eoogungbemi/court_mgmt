@@ -58,3 +58,6 @@ HEARING_DURATIONS = {
 }
 
 COMPLEXITY_MULTIPLIER = {"low": 0.8, "medium": 1.0, "high": 1.5}
+
+# Default is intentionally weak — override via CLERK_PASSWORD env var or st.secrets
+CLERK_PASSWORD = _secret("CLERK_PASSWORD", "clerk123")
